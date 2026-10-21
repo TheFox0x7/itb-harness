@@ -1,0 +1,30 @@
+[project]
+name = "itb-harness"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "TheFox0x7", email = "thefox0x7@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "mistralai>=3.3.0",
+    "pillow>=11.0",
+    "pydantic>=2.0",
+]
+
+[project.scripts]
+itb-harness = "itb_harness:main"
+itb-agent = "itb_harness.loop:main"
+
+[project.optional-dependencies]
+kde = [
+    "kwcapture>=0.7.0",
+]
+x11 = [
+    "python-xlib>=0.33",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.4,<0.14.0"]
+build-backend = "uv_build"
