@@ -18,6 +18,7 @@ import argparse
 import base64
 import json
 import sys
+import textwrap
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -71,6 +72,14 @@ Rules:
 
 Do not return prose, markdown, tool calls, or explanations. Return only the
 JSON array.
+
+## Game rules
+
+You'll learn as you go but here is a basic flow of each battle:
+- At the start you will be deploying your mechs. You may only deploy one per tile, clicking on the same tile twice swaps them.
+- You typically don't deal enough damage to kill enemies before they hurt cities or mechs.
+- Use your attacks to reposition the enemy making, causing it to miss or strike a different enemy.
+- Some levels have side objectives. Competing them is beneficial long term
 """
 
 
@@ -80,8 +89,9 @@ class LoopConfig:
     max_actions_per_turn: int = 12
     max_images: int = 4
     action_delay: float = 0.15
+    show_thinking: bool = False
     out_dir: Path = field(default_factory=lambda: Path("runs"))
-    model: str = "mistral-small-2603"
+    model: str = "mistral-large-4"
 
 
 @dataclass(slots=True)
@@ -113,13 +123,16 @@ class Recorder:
         backend: CaptureBackend,
         input_backend: InputBackend,
         model: str,
+        cache_key: str | None,
         target: WindowInfo,
         config: LoopConfig,
     ) -> None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         self.root = out_dir / f"{stamp}-agent"
         self.frames_dir = self.root / "frames"
+        self.thinking_dir = self.root / "thinking"
         self.frames_dir.mkdir(parents=True, exist_ok=False)
+        self.thinking_dir.mkdir(parents=True, exist_ok=True)
         self.frame_index = 0
 
         self.actions_path = self.root / "actions.jsonl"
@@ -133,6 +146,7 @@ class Recorder:
                     "backend": backend.name,
                     "input": input_backend.name,
                     "model": model,
+                    "prompt_cache_key": cache_key,
                     "max_steps": config.max_steps,
                     "max_actions_per_turn": config.max_actions_per_turn,
                     "action_delay": config.action_delay,
@@ -154,9 +168,17 @@ class Recorder:
         return path
 
     def log_turn(self, step: int, turn: ModelTurn) -> None:
-        self._conversation.write(
-            json.dumps({"step": step, "content": turn.content}) + "\n"
-        )
+        record: dict[str, Any] = {
+            "step": step,
+            "content": turn.content,
+            "thinking": turn.thinking,
+            "usage": turn.usage,
+        }
+        if turn.thinking:
+            path = self.thinking_dir / f"{step:04d}.txt"
+            path.write_text(turn.thinking, encoding="utf-8")
+            record["thinking_file"] = str(path.relative_to(self.root))
+        self._conversation.write(json.dumps(record) + "\n")
         self._conversation.flush()
 
     def log_actions(
@@ -187,6 +209,26 @@ class Recorder:
         self._conversation.close()
 
 
+class ThinkingPrinter:
+    """Stream reasoning chunks to the terminal as they arrive."""
+
+    def __init__(self) -> None:
+        self.started = False
+
+    def write(self, text: str) -> None:
+        if not text:
+            return
+        if not self.started:
+            print("  thinking:", flush=True)
+            self.started = True
+        sys.stdout.write(text.replace("\n", "\n    "))
+        sys.stdout.flush()
+
+    def close(self) -> None:
+        if self.started:
+            print()
+
+
 class HarnessLoop:
     """Screenshot -> point list -> click/hover -> screenshot."""
 
@@ -208,9 +250,15 @@ class HarnessLoop:
             backend,
             input_backend,
             getattr(agent, "model", "unknown"),
+            getattr(agent, "prompt_cache_key", None),
             target,
             self.config,
         )
+
+        print(f"Target  [{target.monitor or '?'}] {target.label}")
+        print(f"Capture {backend.name}")
+        print(f"Input   {input_backend.name}")
+        print(f"Output  {self.recorder.root}")
 
         self.messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT}
@@ -232,15 +280,20 @@ class HarnessLoop:
         path = self.recorder.save_frame(frame)
         self.last_frame_path = path
         print(
-            f"[frame {self.recorder.frame_index:04d}] "
-            f"{frame.width}x{frame.height}  {frame.window.monitor or '?':6}  "
-            f"{path}"
+            f"  frame {self.recorder.frame_index:04d}  "
+            f"{frame.width}x{frame.height}  "
+            f"[{frame.window.monitor or '?'}]  "
+            f"{path.relative_to(self.recorder.root)}"
         )
         return frame
 
     def _prune_images(self) -> None:
-        # Keep at least the newest frame, even if the config is set to 0.
-        keep = max(1, self.config.max_images)
+        # max_images <= 0 keeps the full history.  This is the cache-friendly
+        # mode: mutating an old message changes the prompt prefix and
+        # invalidates any cached tokens from that point onward.
+        if self.config.max_images <= 0:
+            return
+        keep = self.config.max_images
         image_messages = []
         for message in self.messages:
             if message.get("role") != "user":
@@ -263,6 +316,7 @@ class HarnessLoop:
         frame = self.frame
         pre_action_frame = self.last_frame_path
         outcomes: list[PointOutcome] = []
+        print(f"  actions: {len(actions)}")
 
         for index, action in enumerate(actions, start=1):
             px, py = point_to_pixels(action, frame.width, frame.height)
@@ -290,11 +344,13 @@ class HarnessLoop:
             outcomes.append(outcome)
             self.action_count += 1
 
-            status = "ok" if ok else f"error={error}"
+            suffix = "" if ok else f"  !! {error}"
             print(
-                f"[step {step:02d}.{index:02d}] {action.label} "
-                f"{action.point_2d} -> pixel {px},{py} -> "
-                f"screen {sx},{sy} ({status})"
+                f"    {index:02d}. {action.label:5} "
+                f"({_fmt_number(action.x)}, {_fmt_number(action.y)})"
+                f"  -> pixel ({px}, {py})"
+                f"  screen ({sx}, {sy})"
+                f"{suffix}"
             )
 
             if self.config.action_delay > 0:
@@ -314,10 +370,32 @@ class HarnessLoop:
 
         try:
             for step in range(1, self.config.max_steps + 1):
-                turn = self.agent.complete(self.messages)
+                print(f"\n[turn {step}/{self.config.max_steps}]")
+                printer = ThinkingPrinter()
+                try:
+                    turn = self.agent.complete(
+                        self.messages, on_thinking=printer.write
+                    )
+                finally:
+                    printer.close()
                 self.recorder.log_turn(step, turn)
-                if turn.content:
-                    print(f"\n[model] {turn.content}")
+                if turn.thinking:
+                    if not printer.started:
+                        if self.config.show_thinking:
+                            print(textwrap.indent(turn.thinking.strip(), "  "))
+                        else:
+                            print(
+                                f"  thinking saved -> thinking/{step:04d}.txt"
+                            )
+                if turn.usage:
+                    cached = turn.usage.get("cached_tokens")
+                    prompt_tokens = turn.usage.get("prompt_tokens")
+                    if cached is not None:
+                        print(
+                            f"  cache: {cached}/"
+                            f"{prompt_tokens if prompt_tokens is not None else '?'} "
+                            "prompt tokens"
+                        )
                 self.messages.append(
                     {"role": "assistant", "content": turn.content}
                 )
@@ -325,7 +403,10 @@ class HarnessLoop:
                 try:
                     actions = parse_point_actions(turn.content or "")
                 except PointParseError as exc:
-                    print(f"[parse error] {exc}")
+                    print(f"  parse error: {exc}")
+                    preview = _preview(turn.content)
+                    if preview:
+                        print(f"  model: {preview}")
                     self.messages.append(
                         {
                             "role": "user",
@@ -339,13 +420,17 @@ class HarnessLoop:
                     continue
 
                 if not actions:
+                    preview = _preview(turn.content)
+                    if preview and preview != "[]":
+                        print(f"  model: {preview}")
+                    print("  model returned no actions; stopping")
                     stopped = "model_stopped"
                     final_text = turn.content
                     break
 
                 if len(actions) > self.config.max_actions_per_turn:
                     print(
-                        f"[parse error] {len(actions)} actions exceeds "
+                        f"  parse error: {len(actions)} actions exceeds "
                         f"limit {self.config.max_actions_per_turn}"
                     )
                     self.messages.append(
@@ -383,6 +468,19 @@ class HarnessLoop:
             stopped=stopped,
             final_text=final_text,
         )
+
+
+def _fmt_number(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:.1f}"
+
+
+def _preview(text: str | None, limit: int = 180) -> str:
+    if not text:
+        return ""
+    single_line = " ".join(text.split())
+    if len(single_line) <= limit:
+        return single_line
+    return single_line[: limit - 3].rstrip() + "..."
 
 
 def _user_image_message(frame: Frame, text: str) -> dict[str, Any]:
@@ -446,9 +544,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds to wait after each click/hover (default: 0.15).",
     )
     parser.add_argument(
+        "--max-images",
+        type=int,
+        default=4,
+        help=(
+            "Screenshots kept in conversation history; 0 keeps everything "
+            "(better prompt-cache reuse, larger context)."
+        ),
+    )
+    parser.add_argument(
+        "--stream",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stream model thinking to the terminal (default: on).",
+    )
+    parser.add_argument(
+        "--show-thinking",
+        action="store_true",
+        help=(
+            "With --no-stream, print the saved thinking after the response. "
+            "Streaming mode already prints it live."
+        ),
+    )
+    parser.add_argument(
+        "--cache-key",
+        default=None,
+        help=(
+            "Stable Mistral prompt_cache_key; defaults to "
+            "MISTRAL_PROMPT_CACHE_KEY or a per-run UUID."
+        ),
+    )
+    parser.add_argument(
         "--model",
         default=None,
-        help="Mistral model (default: MISTRAL_MODEL or mistral-small-2603).",
+        help="Mistral model (default: MISTRAL_MODEL or mistral-large-4).",
     )
     parser.add_argument(
         "--list",
@@ -492,7 +621,11 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
         try:
-            agent = MistralAgent(model=args.model)
+            agent = MistralAgent(
+                model=args.model,
+                prompt_cache_key=args.cache_key,
+                stream=args.stream,
+            )
         except RuntimeError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
@@ -503,13 +636,13 @@ def main(argv: list[str] | None = None) -> int:
         config = LoopConfig(
             max_steps=max(1, args.steps),
             max_actions_per_turn=max(1, args.max_actions),
+            max_images=args.max_images,
             action_delay=max(0.0, args.action_delay),
+            show_thinking=args.show_thinking,
             out_dir=args.out.expanduser(),
             model=agent.model,
         )
         loop = HarnessLoop(backend, target, agent, input_backend, config)
-        print(f"Target: [{target.monitor or '?'}] {target.label}")
-        print(f"Input:  {input_backend.name}")
         try:
             result = loop.run()
         except Exception as exc:

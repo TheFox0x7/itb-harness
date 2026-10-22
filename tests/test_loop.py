@@ -61,8 +61,9 @@ class FakeBackend:
 
 
 class FakeMistralClient:
-    def __init__(self, content: str = '[]') -> None:
+    def __init__(self, content: object = "[]", usage: object = None) -> None:
         self.content = content
+        self.usage = usage
         self.requests: list[dict[str, object]] = []
         self.chat = SimpleNamespace(complete=self._complete)
 
@@ -70,7 +71,7 @@ class FakeMistralClient:
         self.requests.append(kwargs)
         message = SimpleNamespace(content=self.content, tool_calls=None)
         return SimpleNamespace(
-            choices=[SimpleNamespace(message=message)]
+            choices=[SimpleNamespace(message=message)], usage=self.usage
         )
 
 
@@ -201,6 +202,118 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(turn.tool_calls, ())
         self.assertNotIn("tools", client.requests[0])
         self.assertNotIn("tool_choice", client.requests[0])
+        self.assertTrue(client.requests[0]["prompt_cache_key"])
+
+    def test_mistral_streams_thinking_and_accumulates_content(self) -> None:
+        def event(content, usage=None):
+            return SimpleNamespace(
+                data=SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(content=content)
+                        )
+                    ],
+                    usage=usage,
+                )
+            )
+
+        usage = SimpleNamespace(
+            prompt_tokens=20,
+            completion_tokens=3,
+            total_tokens=23,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+        events = [
+            event([
+                {
+                    "type": "thinking",
+                    "thinking": [{"type": "text", "text": "look "}],
+                }
+            ]),
+            event([
+                {
+                    "type": "thinking",
+                    "thinking": [{"type": "text", "text": "left"}],
+                }
+            ]),
+            event([{"type": "text", "text": "[]"}], usage=usage),
+        ]
+
+        class StreamingClient:
+            def __init__(self) -> None:
+                self.requests = []
+                self.chat = SimpleNamespace(stream=self._stream)
+
+            def _stream(self, **kwargs):
+                self.requests.append(kwargs)
+                return iter(events)
+
+        client = StreamingClient()
+        agent = MistralAgent(
+            model="test", client=client, stream=True
+        )
+        chunks: list[str] = []
+        turn = agent.complete([], None, on_thinking=chunks.append)
+        self.assertEqual(chunks, ["look ", "left"])
+        self.assertEqual(turn.thinking, "look left")
+        self.assertEqual(turn.content, "[]")
+        self.assertEqual(turn.usage["cached_tokens"], 0)
+        self.assertIn("prompt_cache_key", client.requests[0])
+
+    def test_mistral_reuses_prompt_cache_key_and_reads_cached_tokens(self) -> None:
+        usage = SimpleNamespace(
+            prompt_tokens=100,
+            completion_tokens=5,
+            total_tokens=105,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=64),
+        )
+        client = FakeMistralClient(content="[]", usage=usage)
+        agent = MistralAgent(
+            model="test", client=client, prompt_cache_key="test-run"
+        )
+        first = agent.complete([], None)
+        second = agent.complete([], None)
+        self.assertEqual(first.usage["cached_tokens"], 64)
+        self.assertEqual(second.usage["prompt_tokens"], 100)
+        self.assertEqual(
+            client.requests[0]["prompt_cache_key"],
+            client.requests[1]["prompt_cache_key"],
+        )
+        self.assertEqual(client.requests[0]["prompt_cache_key"], "test-run")
+
+    def test_thinking_is_saved_even_when_not_printed(self) -> None:
+        turns = [
+            ModelTurn(content="[]", thinking="The mech is exposed on the left.")
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(turns, Path(tmp))
+            thinking_file = result.run_dir / "thinking" / "0001.txt"
+            self.assertEqual(
+                thinking_file.read_text(),
+                "The mech is exposed on the left.",
+            )
+            record = json.loads(
+                (result.run_dir / "conversation.jsonl")
+                .read_text()
+                .splitlines()[0]
+            )
+            self.assertEqual(record["thinking"], "The mech is exposed on the left.")
+            self.assertEqual(pointer.events, [])
+
+    def test_mistral_adapter_splits_thinking_from_content(self) -> None:
+        client = FakeMistralClient(
+            content=[
+                {
+                    "type": "thinking",
+                    "thinking": [{"type": "text", "text": "reasoning"}],
+                },
+                {"type": "text", "text": "[]"},
+            ]
+        )
+        agent = MistralAgent(model="test", client=client)
+        turn = agent.complete([], None)
+        self.assertEqual(turn.content, "[]")
+        self.assertEqual(turn.thinking, "reasoning")
 
 
 if __name__ == "__main__":

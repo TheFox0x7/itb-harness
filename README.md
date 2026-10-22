@@ -112,6 +112,26 @@ DISPLAY=:2 XAUTHORITY=/run/user/1000/xauth_... \
 nested display.  `--max-actions` caps a batch, and `--action-delay` inserts a
 pause between inputs.
 
+Thinking is streamed live by default (`--no-stream` disables it).  It is also
+always saved to disk when the model provides it.  With `--no-stream`, use
+`--show-thinking` to print the saved reasoning after the response.
+
+### Prompt caching
+
+The agent sends a stable `prompt_cache_key` on every request (per-run UUID,
+`--cache-key`, or `MISTRAL_PROMPT_CACHE_KEY`).  Responses report cached prompt
+tokens in `usage`, which are logged and shown as:
+
+```text
+  cache: 64/1024 prompt tokens
+```
+
+Mistral caching is prefix-based and best-effort.  The default
+`--max-images 4` prunes old screenshots, which changes the historical prefix
+and invalidates cache entries from that point onward.  For maximum cache reuse
+use `--max-images 0` (keep full history) and accept the larger context; for a
+smaller context, keep pruning and accept cache misses after prunes.
+
 Each iteration:
 
 1. capture the target window
@@ -129,12 +149,17 @@ Output:
 runs/<timestamp>-agent/
   run.json              backend, input backend, model, target, limits
   frames/0001.png       initial and post-batch screenshots
+  thinking/0001.txt     model reasoning/thinking chunks, if provided
   actions.jsonl         point_2d, pixel/screen coords, label, result, frames
-  conversation.jsonl    model responses
+  conversation.jsonl    model content and thinking per turn
 ```
 
 Old screenshots are pruned from the conversation (`max_images` in `LoopConfig`,
 default 4) so the context does not grow without bound.
+
+`Ctrl-C` currently stops the loop after the model turn / action batch is
+finished.  A fully interruptible, open-ended run can replace the `--steps` cap
+later without changing the point/input protocol.
 
 ## Tool schemas (not wired)
 
