@@ -129,6 +129,7 @@ class MistralAgent:
         text_parts: list[str] = []
         thinking_parts: list[str] = []
         usage: dict[str, int] | None = None
+        tool_calls: dict[int, dict[str, Any]] = {}
 
         for event in self.client.chat.stream(**request):
             chunk = getattr(event, "data", event)
@@ -144,10 +145,14 @@ class MistralAgent:
                 _consume_stream_content(
                     content, text_parts, thinking_parts, on_thinking
                 )
+                _consume_stream_tool_calls(
+                    getattr(delta, "tool_calls", None), tool_calls
+                )
 
         return ModelTurn(
             content="".join(text_parts) or None,
             thinking="".join(thinking_parts) or None,
+            tool_calls=_finalize_stream_tool_calls(tool_calls),
             usage=usage,
         )
 
@@ -172,6 +177,62 @@ class ScriptedAgent:
         turn = self._turns[self.index]
         self.index += 1
         return turn
+
+
+def _consume_stream_tool_calls(
+    calls: Any, accumulator: dict[int, dict[str, Any]]
+) -> None:
+    for position, call in enumerate(calls or []):
+        index = getattr(call, "index", None)
+        if index is None:
+            index = position
+        index = int(index)
+
+        entry = accumulator.setdefault(
+            index, {"id": None, "name": "", "arguments": ""}
+        )
+        call_id = getattr(call, "id", None)
+        if call_id:
+            entry["id"] = str(call_id)
+
+        function = getattr(call, "function", None)
+        if function is None:
+            continue
+        name = getattr(function, "name", None)
+        if name:
+            entry["name"] = str(name)
+        arguments = getattr(function, "arguments", None)
+        if isinstance(arguments, str):
+            entry["arguments"] += arguments
+        elif isinstance(arguments, dict):
+            entry["arguments"] += json.dumps(arguments)
+
+
+def _finalize_stream_tool_calls(
+    accumulator: dict[int, dict[str, Any]],
+) -> tuple[ModelToolCall, ...]:
+    result: list[ModelToolCall] = []
+    for index in sorted(accumulator):
+        entry = accumulator[index]
+        name = entry["name"]
+        if not name:
+            continue
+        raw = entry["arguments"].strip()
+        if raw:
+            try:
+                arguments: Any = json.loads(raw)
+            except json.JSONDecodeError:
+                arguments = raw
+        else:
+            arguments = {}
+        result.append(
+            ModelToolCall(
+                id=entry["id"] or f"call-{index + 1}",
+                name=name,
+                arguments=arguments,
+            )
+        )
+    return tuple(result)
 
 
 def _usage_dict(usage: Any) -> dict[str, int] | None:

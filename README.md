@@ -85,23 +85,42 @@ revalidated before each capture and the run fails if the window closes.
 ## Agent loop
 
 The observer/act loop lives in `src/itb_harness/loop.py` and runs as
-`itb-agent`.  Tool calling is not wired; the model replies with a JSON array of
-point actions:
+`itb-agent`.
 
-```json
-[
-  {"point_2d": [500, 250], "label": "click"},
-  {"point_2d": [750, 250], "label": "hover"}
-]
-```
+The model is not given an automatic screenshot. It has the following tools,
+plus an optional persistent-note tool:
 
-Coordinates are normalized to `0..1000`, origin top-left.  `click` performs a
-left click; `hover` only moves the pointer.  Actions are executed in order, then
-one new screenshot is captured.
+| Tool | Args | Effect |
+|---|---|---|
+| `view_board` | — | Capture and return the current game screenshot |
+| `click` | `point_2d` screenshot pixels | Move the pointer and left-click |
+| `inspect` | `point_2d`, optional `with_details` | Hover and capture; `with_details` holds Left Ctrl while capturing |
+| `attack_order` | — | Hold Left Alt and capture the attack-order preview |
+| `repair` | — | Press `R`; then click the selected mech as the repair target |
+| `weapon` | `number` 1 or 2 | Press that number; then click the target |
+| `select_unit` | `number` 1-5 | Press A/S/D/Z/X for units 1-5 |
+| `end_turn` | — | Press Space |
+| `undo_move` | — | Press Left Shift; only moves can be undone, attacks are permanent |
+| `reset_turn` | — | Press Backspace; once per mission and not always available |
+| `cancel` | — | Right-click |
+| `note` | `text` | Append a note for future runs (only with `--notes`) |
+
+Coordinates are `[x, y]` in screenshot pixels, origin top-left; the valid
+range is `0..width-1` by `0..height-1`. `view_board` reports the screenshot
+dimensions. `repair`, `weapon`, and `select_unit` operate on the current UI
+selection; select mechs and weapons with clicks or the unit keys.
+
+`inspect` and `attack_order` return screenshots. `click`, `repair`, `weapon`,
+`select_unit`, `end_turn`, `undo_move`, `reset_turn`, and `cancel` return text
+only; call `view_board` when you need to see the result.
+
+The model is instructed to call `view_board` first and to call it again after
+an action when it needs to see the result. `inspect` is for tooltips/hover
+states and returns the screenshot captured after hovering.
 
 ```bash
 export MISTRAL_API_KEY=...
-export MISTRAL_MODEL=mistral-small-2603   # optional
+export MISTRAL_MODEL=mistral-large-4   # optional
 
 DISPLAY=:2 XAUTHORITY=/run/user/1000/xauth_... \
   uv run itb-agent --backend x11 --window Breach --steps 10 --input x11
@@ -109,94 +128,73 @@ DISPLAY=:2 XAUTHORITY=/run/user/1000/xauth_... \
 
 `--input stub` (the default) records clicks/hovers without touching the pointer.
 `--input x11` performs real XTest input on `DISPLAY`; use it with the gamescope
-nested display.  `--max-actions` caps a batch, and `--action-delay` inserts a
-pause between inputs.
+nested display. `--action-delay` waits after clicks, keys, and hover actions;
+`--max-images` controls how many tool screenshots stay in history (`0` keeps
+everything).
 
-Thinking is streamed live by default (`--no-stream` disables it).  It is also
-always saved to disk when the model provides it.  With `--no-stream`, use
+Enable persistent notes with:
+
+```bash
+uv run itb-agent ... --notes --notes-file notes.md
+```
+
+Existing notes are loaded into the system prompt at startup; the optional
+`note` tool appends new entries for future runs. Notes are not injected
+mid-run, which keeps the prompt prefix stable. `--notes-max-chars` limits how
+much of a long notes file is loaded.
+
+Each iteration:
+
+1. send the tool schemas and conversation to the model
+2. execute the single tool call it returns
+3. append the tool result (text or image)
+4. repeat until `--steps` or the model returns no tool call
+
+Thinking is streamed live by default (`--no-stream` disables it). It is also
+always saved to disk when the model provides it. With `--no-stream`, use
 `--show-thinking` to print the saved reasoning after the response.
+
+Output:
+
+```text
+runs/<timestamp>-agent/
+  run.json              backend, input, model, cache key, limits
+  frames/0001.png       screenshots returned by view_board/inspect
+  thinking/0001.txt     model reasoning/thinking chunks, if provided
+  actions.jsonl         tool name, args, result, frame links
+  conversation.jsonl    model content, thinking, usage, tool calls
+```
+
+Old tool-message screenshots are pruned from the conversation by default
+(`--max-images 4`) so the context stays bounded. Pruning changes the historical
+prompt prefix and invalidates cache entries from that point onward; use
+`--max-images 0` for append-only history and better prompt-cache reuse.
+
+Notes live in a separate Markdown file (`notes.md` by default), outside the run
+directory, so they persist across runs and are easy to review.
+
+`Ctrl-C` stops the loop after the current tool call; a fully interruptible,
+open-ended run can replace the `--steps` cap later without changing the tool
+protocol.
 
 ### Prompt caching
 
 The agent sends a stable `prompt_cache_key` on every request (per-run UUID,
-`--cache-key`, or `MISTRAL_PROMPT_CACHE_KEY`).  Responses report cached prompt
+`--cache-key`, or `MISTRAL_PROMPT_CACHE_KEY`). Responses report cached prompt
 tokens in `usage`, which are logged and shown as:
 
 ```text
   cache: 64/1024 prompt tokens
 ```
 
-Mistral caching is prefix-based and best-effort.  The default
-`--max-images 4` prunes old screenshots, which changes the historical prefix
-and invalidates cache entries from that point onward.  For maximum cache reuse
-use `--max-images 0` (keep full history) and accept the larger context; for a
-smaller context, keep pruning and accept cache misses after prunes.
+Mistral caching is prefix-based and best-effort.
 
-Each iteration:
+## Legacy tool schemas (not used)
 
-1. capture the target window
-2. send the screenshot to the model
-3. parse the JSON point list
-4. execute `click`/`hover` in order
-5. capture a new screenshot and repeat until `--steps`
-
-A malformed response is returned to the model as a text error without executing
-anything or capturing a new frame.
-
-Output:
-
-```text
-runs/<timestamp>-agent/
-  run.json              backend, input backend, model, target, limits
-  frames/0001.png       initial and post-batch screenshots
-  thinking/0001.txt     model reasoning/thinking chunks, if provided
-  actions.jsonl         point_2d, pixel/screen coords, label, result, frames
-  conversation.jsonl    model content and thinking per turn
-```
-
-Old screenshots are pruned from the conversation (`max_images` in `LoopConfig`,
-default 4) so the context does not grow without bound.
-
-`Ctrl-C` currently stops the loop after the model turn / action batch is
-finished.  A fully interruptible, open-ended run can replace the `--steps` cap
-later without changing the point/input protocol.
-
-## Tool schemas (not wired)
-
-`src/itb_harness/tools.py` is retained for a future structured-action mode, but
-the current loop does **not** send or execute these tools.  Point actions are
-the active interface.
-
-| Tool | Args | Kind |
-|---|---|---|
-| `move_mech` | `mech` (1-3), `target` `{x,y}` | action |
-| `prepare_attack` | `mech` (1-3), `weapon` (1-3) | action |
-| `execute_attack` | `target` `{x,y}` | action |
-| `end_turn` | — | action |
-| `reset_turn` | — | action |
-| `inspect` | `target` `{x,y}` | observation |
-
-Board coordinates are 0-7, origin top-left.  `inspect` is intentionally
-image-only: it will return a crop once the board grid is calibrated, not
-structured game state.  Keep hidden state out of the model if the point is to
-test vision and reasoning.
-
-```python
-from itb_harness.tools import ToolRegistry, StubActions
-
-registry = ToolRegistry()                    # dry-run stubs
-registry = ToolRegistry(StubActions(dry_run=False))  # "not implemented" errors
-tools = registry.mistral_tools()             # pass as `tools=` to Mistral
-
-result = registry.execute("move_mech", {"mech": 1, "target": {"x": 3, "y": 4}})
-message = result.as_tool_message("call-123", "move_mech")
-```
-
-The stubs validate shapes/ranges and the prepare-then-fire sequence.  They
-cannot validate board legality yet; that belongs in a `GameActions`
-implementation backed by Lua or UI input.  A failed action should come back as
-`ok=False` plus an error code, with `state_changed=False`; then the harness
-should re-prompt with the same screenshot instead of capturing a new one.
+`src/itb_harness/tools.py` still contains the earlier semantic action tools
+(`move_mech`, `end_turn`, etc.) and `ToolResult`, but the loop does not send
+those schemas. The active board tools are defined in
+`src/itb_harness/board_tools.py`.
 
 ## Cross-platform note
 

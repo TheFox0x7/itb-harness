@@ -1,15 +1,13 @@
 """Main observer/act loop.
 
-One iteration is:
+The model is not given an automatic screenshot.  It has three tools:
 
-    screenshot -> model returns point actions -> execute click/hover -> screenshot
+    view_board()          capture and return the board
+    click(point_2d)       click at screenshot pixel (x, y)
+    inspect(point_2d)     hover, wait, capture and return a screenshot
 
-The model does not use tool calling in this mode.  It replies with a JSON list
-of normalized points and a label, for example:
-
-    [{"point_2d": [500, 250], "label": "click"}]
-
-Points are processed in order, then a fresh screenshot is captured.
+The loop executes one tool call per model turn, feeds the tool result back, and
+lets the model decide what to do next.
 """
 
 from __future__ import annotations
@@ -25,7 +23,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .agent import ChatAgent, MistralAgent, ModelTurn
+from .agent import ChatAgent, MistralAgent, ModelToolCall, ModelTurn
+from .board_tools import (
+    parse_inspect_args,
+    parse_note_args,
+    parse_point_args,
+    parse_select_unit_args,
+    parse_weapon_args,
+    tool_schemas,
+)
 from .capture import (
     BackendUnavailable,
     CaptureBackend,
@@ -37,56 +43,62 @@ from .capture import (
 )
 from .cli import format_windows
 from .input import InputBackend, get_input_backend
-from .points import (
-    PointAction,
-    PointParseError,
-    parse_point_actions,
-    point_to_pixels,
-)
+from .notes import NotesStore
+from .tools import ToolResult
 
+
+UNIT_KEYS = {1: "a", 2: "s", 3: "d", 4: "z", 5: "x"}
 
 SYSTEM_PROMPT = """\
 You are controlling the game Into the Breach.
 
-You receive screenshots of the game window. Use your vision to decide what to
-do next. Each point you return will move the pointer to that point and perform
-the action named by its label.
+You do not receive screenshots automatically. Use the tools supplied with the
+request:
 
-Return only a JSON array of point actions:
+- view_board: capture and return the current game screenshot.
+- click: move to a screenshot pixel coordinate and left-click.
+- inspect: hover at a screenshot pixel coordinate, wait briefly, then capture
+  and return a screenshot. Use with_details=true to hold Left Ctrl for
+  detailed tooltips.
+- attack_order: hold Left Alt and capture the attack-order preview.
+- repair: press R to activate repair mode, then click the selected mech.
+- weapon: press 1 or 2 to select a weapon, then click the target.
+- select_unit: select unit 1-5 (A/S/D/Z/X).
+- end_turn, undo_move, reset_turn, cancel: turn and cancellation controls.
 
-[
-  {"point_2d": [500, 250], "label": "click"},
-  {"point_2d": [750, 250], "label": "hover"}
-]
+Coordinates are [x, y] in screenshot pixels, with (0, 0) at the top-left and
+the bottom-right at (width - 1, height - 1). Use the dimensions reported by
+view_board. Call view_board before your first click, and call view_board again
+after a click when you need to see the result. Inspect before committing an
+attack when you are unsure of the result.
 
-Rules:
-- point_2d is [x, y], normalized from 0 to 1000.
-- x=0 is the left edge, x=1000 the right edge.
-- y=0 is the top edge, y=1000 the bottom edge.
-- label is either "click" or "hover".
-- Actions are performed in the order you provide them.
-- After the whole list is processed, a new screenshot will be provided.
-- If unsure, return a single input to see the result.
-- If an input fails, re-examine the screenshot before retrying. Do not repeat a
-  failed action blindly.
+Use exactly one tool per turn. Do not describe an action in prose; call a tool.
+If a tool returns an error, inspect the last screenshot and try a different
+approach. Do not repeat a failed action blindly.
 
-Do not return prose, markdown, tool calls, or explanations. Return only the
-JSON array.
+The game has 3 phases:
+- Deployment where you need to place your units on tan spots. 
+Pay attention to building placements and enemies to try and get early advantage.
+After you deploy all your units click confirm to deploy them. Then the enemy takes it's initial turn.
+You can ONLY place the units on the tan spots. To deploy a unit you must click on the tile.
+Clicking the tile again will swap units with the next one that is to be deployed or will allow you to change placement.
+Yellow arrow under a unit means the unit will be deployed to that spot. A refresh icon indicates that mech will be swapped with one that is about to be deployed.
 
-## Game rules
+- Enemy turn. If you see that information in the screenshot you should wait and take another. You can't do anything while enemy takes it's turn.
+- Your turn. Now you get to move your units. Each unit can move and attack in the same turn but an attack ends the turn.
+Units can have multiple abilities to use on the lower bar of the screen. Inspect them to learn more and plan to use the attacks optimally.
 
-You'll learn as you go but here is a basic flow of each battle:
-- At the start you will be deploying your mechs. You may only deploy one per tile, clicking on the same tile twice swaps them.
-- You typically don't deal enough damage to kill enemies before they hurt cities or mechs.
-- Use your attacks to reposition the enemy making, causing it to miss or strike a different enemy.
-- Some levels have side objectives. Competing them is beneficial long term
+Use notes tool to note down things you learned or misunderstood about instructions so future iterations can be adjusted.
+
+Your primary goal is to protect buildings and accomplish side objectives. Sometimes sacrifice of unit health or entire unit can be optimal,
+but it will mean you lose the pilot and all the perks they had if mech is destroyed. Your power grid shows how many times you can lose a building in the run.
+You lose the game it it reaches 0 bars. Grid defense is a chance to mitigate the damage to the grid completely, however it works per attack.
 """
 
 
 @dataclass(slots=True)
 class LoopConfig:
     max_steps: int = 20
-    max_actions_per_turn: int = 12
     max_images: int = 4
     action_delay: float = 0.15
     show_thinking: bool = False
@@ -104,18 +116,8 @@ class LoopResult:
     final_text: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class PointOutcome:
-    index: int
-    action: PointAction
-    pixel: tuple[int, int]
-    screen: tuple[int, int]
-    ok: bool
-    error: str | None = None
-
-
 class Recorder:
-    """Write frames, model turns, and point actions for one run."""
+    """Write frames, model turns, and tool results for one run."""
 
     def __init__(
         self,
@@ -124,6 +126,7 @@ class Recorder:
         input_backend: InputBackend,
         model: str,
         cache_key: str | None,
+        notes: NotesStore | None,
         target: WindowInfo,
         config: LoopConfig,
     ) -> None:
@@ -147,8 +150,9 @@ class Recorder:
                     "input": input_backend.name,
                     "model": model,
                     "prompt_cache_key": cache_key,
+                    "notes_file": str(notes.path) if notes is not None else None,
                     "max_steps": config.max_steps,
-                    "max_actions_per_turn": config.max_actions_per_turn,
+                    "max_images": config.max_images,
                     "action_delay": config.action_delay,
                     "started_at": datetime.now(timezone.utc).isoformat(
                         timespec="seconds"
@@ -173,6 +177,14 @@ class Recorder:
             "content": turn.content,
             "thinking": turn.thinking,
             "usage": turn.usage,
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "name": call.name,
+                    "arguments": _jsonable(call.arguments),
+                }
+                for call in turn.tool_calls
+            ],
         }
         if turn.thinking:
             path = self.thinking_dir / f"{step:04d}.txt"
@@ -181,27 +193,34 @@ class Recorder:
         self._conversation.write(json.dumps(record) + "\n")
         self._conversation.flush()
 
-    def log_actions(
+    def log_tool_call(
         self,
         step: int,
-        outcomes: list[PointOutcome],
-        frame_path: Path,
-        next_frame_path: Path,
+        call: ModelToolCall,
+        result: ToolResult,
+        frame_path: Path | None,
+        source_frame_path: Path | None,
     ) -> None:
-        for outcome in outcomes:
-            record = {
-                "step": step,
-                "index": outcome.index,
-                "label": outcome.action.label,
-                "point_2d": outcome.action.point_2d,
-                "pixel": list(outcome.pixel),
-                "screen": list(outcome.screen),
-                "ok": outcome.ok,
-                "error": outcome.error,
-                "frame": str(frame_path.relative_to(self.root)),
-                "next_frame": str(next_frame_path.relative_to(self.root)),
-            }
-            self._actions.write(json.dumps(record) + "\n")
+        record = {
+            "step": step,
+            "tool": call.name,
+            "arguments": _jsonable(call.arguments),
+            "ok": result.ok,
+            "error": result.error,
+            "message": result.message,
+            "state_changed": result.state_changed,
+            "frame": (
+                str(frame_path.relative_to(self.root))
+                if frame_path is not None
+                else None
+            ),
+            "source_frame": (
+                str(source_frame_path.relative_to(self.root))
+                if source_frame_path is not None
+                else None
+            ),
+        }
+        self._actions.write(json.dumps(record) + "\n")
         self._actions.flush()
 
     def close(self) -> None:
@@ -230,7 +249,7 @@ class ThinkingPrinter:
 
 
 class HarnessLoop:
-    """Screenshot -> point list -> click/hover -> screenshot."""
+    """Tool-driven observe/act loop."""
 
     def __init__(
         self,
@@ -239,11 +258,13 @@ class HarnessLoop:
         agent: ChatAgent,
         input_backend: InputBackend,
         config: LoopConfig | None = None,
+        notes: NotesStore | None = None,
     ) -> None:
         self.backend = backend
         self.target = target
         self.agent = agent
         self.input = input_backend
+        self.notes = notes
         self.config = config or LoopConfig()
         self.recorder = Recorder(
             self.config.out_dir,
@@ -251,32 +272,42 @@ class HarnessLoop:
             input_backend,
             getattr(agent, "model", "unknown"),
             getattr(agent, "prompt_cache_key", None),
+            notes,
             target,
             self.config,
         )
 
+        self.frame: Frame | None = None
+        self.last_frame_path: Path | None = None
+        self.action_count = 0
+
         print(f"Target  [{target.monitor or '?'}] {target.label}")
         print(f"Capture {backend.name}")
         print(f"Input   {input_backend.name}")
+        if notes is not None:
+            print(f"Notes   {notes.path} ({notes.char_count} chars loaded)")
         print(f"Output  {self.recorder.root}")
 
+        system_prompt = SYSTEM_PROMPT
+        if notes is not None:
+            rendered_notes = notes.render_for_prompt()
+            if rendered_notes:
+                system_prompt += "\n\n" + rendered_notes
+
         self.messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": (
+                    "Start by calling view_board. Use one tool per turn."
+                ),
+            },
         ]
-        self.frame = self._capture()
-        self.last_frame_path = self.recorder.frames_dir / "0001.png"
-        self.messages.append(
-            _user_image_message(
-                self.frame,
-                "Initial screenshot. It is your turn. Return a JSON list of "
-                "point actions.",
-            )
-        )
-        self.action_count = 0
 
     def _capture(self) -> Frame:
         frame = self.backend.capture_window(self.target.id)
         self.target = frame.window
+        self.frame = frame
         path = self.recorder.save_frame(frame)
         self.last_frame_path = path
         print(
@@ -288,15 +319,16 @@ class HarnessLoop:
         return frame
 
     def _prune_images(self) -> None:
-        # max_images <= 0 keeps the full history.  This is the cache-friendly
-        # mode: mutating an old message changes the prompt prefix and
-        # invalidates any cached tokens from that point onward.
+        # Keep the latest screenshots and replace older tool-message images
+        # with text.  This changes the prompt prefix and therefore invalidates
+        # prompt cache entries from that point onward; --max-images 0 keeps the
+        # full append-only history for better caching.
         if self.config.max_images <= 0:
             return
-        keep = self.config.max_images
+
         image_messages = []
         for message in self.messages:
-            if message.get("role") != "user":
+            if message.get("role") != "tool":
                 continue
             content = message.get("content")
             if isinstance(content, list) and any(
@@ -305,63 +337,266 @@ class HarnessLoop:
             ):
                 image_messages.append(message)
 
-        for message in image_messages[:-keep]:
-            message["content"] = [
-                {"type": "text", "text": "[older screenshot omitted]"}
-            ]
-
-    def _execute_actions(
-        self, step: int, actions: list[PointAction]
-    ) -> tuple[list[PointOutcome], Path]:
-        frame = self.frame
-        pre_action_frame = self.last_frame_path
-        outcomes: list[PointOutcome] = []
-        print(f"  actions: {len(actions)}")
-
-        for index, action in enumerate(actions, start=1):
-            px, py = point_to_pixels(action, frame.width, frame.height)
-            sx = frame.window.x + px
-            sy = frame.window.y + py
-            try:
-                if action.label == "click":
-                    self.input.click(sx, sy)
-                else:
-                    self.input.hover(sx, sy)
-                ok = True
-                error = None
-            except Exception as exc:
-                ok = False
-                error = str(exc)
-
-            outcome = PointOutcome(
-                index=index,
-                action=action,
-                pixel=(px, py),
-                screen=(sx, sy),
-                ok=ok,
-                error=error,
-            )
-            outcomes.append(outcome)
-            self.action_count += 1
-
-            suffix = "" if ok else f"  !! {error}"
-            print(
-                f"    {index:02d}. {action.label:5} "
-                f"({_fmt_number(action.x)}, {_fmt_number(action.y)})"
-                f"  -> pixel ({px}, {py})"
-                f"  screen ({sx}, {sy})"
-                f"{suffix}"
+        for message in image_messages[: -self.config.max_images]:
+            message["content"] = json.dumps(
+                {"ok": True, "message": "[older screenshot omitted]"}
             )
 
-            if self.config.action_delay > 0:
-                time.sleep(self.config.action_delay)
+    def _require_frame(self) -> Frame:
+        if self.frame is None or self.last_frame_path is None:
+            raise ValueError("Call view_board before click or inspect.")
+        return self.frame
 
-        # A list represents one action batch; capture once afterwards.
-        self.frame = self._capture()
-        self.recorder.log_actions(
-            step, outcomes, pre_action_frame, self.last_frame_path
-        )
-        return outcomes, self.last_frame_path
+    def _pause(self) -> None:
+        if self.config.action_delay > 0:
+            time.sleep(self.config.action_delay)
+
+    def _validate_point(self, frame: Frame, x: int, y: int) -> None:
+        if not (0 <= x < frame.width and 0 <= y < frame.height):
+            raise ValueError(
+                f"Point ({x}, {y}) is outside the screenshot "
+                f"{frame.width}x{frame.height}."
+            )
+
+    def _execute_tool(
+        self, call: ModelToolCall
+    ) -> tuple[ToolResult, Path | None]:
+        try:
+            if call.name == "note":
+                if self.notes is None:
+                    return (
+                        ToolResult(
+                            ok=False,
+                            error="notes_disabled",
+                            message="Notes are not enabled for this run.",
+                        ),
+                        None,
+                    )
+                text = parse_note_args(call.arguments)
+                self.notes.append(text, run_id=self.recorder.root.name)
+                return (
+                    ToolResult(
+                        ok=True,
+                        message=(
+                            f"Saved note for future runs "
+                            f"({len(text)} chars)."
+                        ),
+                    ),
+                    None,
+                )
+
+            if call.name == "view_board":
+                frame = self._capture()
+                return (
+                    ToolResult(
+                        ok=True,
+                        message=(
+                            "Current board screenshot attached "
+                            f"({frame.width}x{frame.height})."
+                        ),
+                        image_png=frame.png,
+                    ),
+                    self.last_frame_path,
+                )
+
+            if call.name == "click":
+                frame = self._require_frame()
+                x, y = parse_point_args(call.arguments)
+                self._validate_point(frame, x, y)
+                sx = frame.window.x + x
+                sy = frame.window.y + y
+                self.input.click(sx, sy)
+                self.action_count += 1
+                self._pause()
+                return (
+                    ToolResult(
+                        ok=True,
+                        message=(
+                            f"Clicked screenshot pixel ({x}, {y}) "
+                            f"at screen ({sx}, {sy})."
+                        ),
+                        state_changed=True,
+                    ),
+                    None,
+                )
+
+            if call.name == "inspect":
+                frame = self._require_frame()
+                x, y, with_details = parse_inspect_args(call.arguments)
+                self._validate_point(frame, x, y)
+                sx = frame.window.x + x
+                sy = frame.window.y + y
+                self.input.hover(sx, sy)
+                if with_details:
+                    self.input.key_down("ctrl")
+                try:
+                    self._pause()
+                    frame = self._capture()
+                finally:
+                    if with_details:
+                        self.input.key_up("ctrl")
+                return (
+                    ToolResult(
+                        ok=True,
+                        message=(
+                            f"Hovered screenshot pixel ({x}, {y}) and "
+                            f"captured a {frame.width}x{frame.height} "
+                            "screenshot"
+                            + (" with details." if with_details else ".")
+                        ),
+                        image_png=frame.png,
+                    ),
+                    self.last_frame_path,
+                )
+
+            if call.name == "attack_order":
+                self.input.key_down("alt")
+                try:
+                    self._pause()
+                    frame = self._capture()
+                finally:
+                    self.input.key_up("alt")
+                return (
+                    ToolResult(
+                        ok=True,
+                        message=(
+                            "Attack-order preview attached "
+                            f"({frame.width}x{frame.height})."
+                        ),
+                        image_png=frame.png,
+                    ),
+                    self.last_frame_path,
+                )
+
+            if call.name == "repair":
+                self.input.key("r")
+                self._pause()
+                return (
+                    ToolResult(
+                        ok=True,
+                        message=(
+                            "Repair mode activated. Click the selected mech "
+                            "as the repair target."
+                        ),
+                        state_changed=True,
+                    ),
+                    None,
+                )
+
+            if call.name == "weapon":
+                number = parse_weapon_args(call.arguments)
+                self.input.key(str(number))
+                self._pause()
+                return (
+                    ToolResult(
+                        ok=True,
+                        message=(
+                            f"Weapon {number} selected. Inspect first to "
+                            "preview possible results, then click the target."
+                        ),
+                        state_changed=True,
+                    ),
+                    None,
+                )
+
+            if call.name == "select_unit":
+                number = parse_select_unit_args(call.arguments)
+                self.input.key(UNIT_KEYS[number])
+                self._pause()
+                return (
+                    ToolResult(
+                        ok=True,
+                        message=(
+                            f"Selected unit {number} with key "
+                            f"{UNIT_KEYS[number]!r}."
+                        ),
+                        state_changed=True,
+                    ),
+                    None,
+                )
+
+            if call.name == "end_turn":
+                self.input.key("space")
+                self._pause()
+                return (
+                    ToolResult(
+                        ok=True,
+                        message="End-turn key pressed.",
+                        state_changed=True,
+                    ),
+                    None,
+                )
+
+            if call.name == "undo_move":
+                self.input.key("shift")
+                self._pause()
+                return (
+                    ToolResult(
+                        ok=True,
+                        message=(
+                            "Undo-move key pressed. Only moves can be undone; "
+                            "attacks are permanent."
+                        ),
+                        state_changed=True,
+                    ),
+                    None,
+                )
+
+            if call.name == "reset_turn":
+                self.input.key("backspace")
+                self._pause()
+                return (
+                    ToolResult(
+                        ok=True,
+                        message=(
+                            "Reset-turn key pressed. This is available at "
+                            "most once per mission and may be unavailable."
+                        ),
+                        state_changed=True,
+                    ),
+                    None,
+                )
+
+            if call.name == "cancel":
+                self.input.right_click()
+                self._pause()
+                return (
+                    ToolResult(
+                        ok=True,
+                        message="Right-clicked to cancel the current selection.",
+                        state_changed=True,
+                    ),
+                    None,
+                )
+
+            return (
+                ToolResult(
+                    ok=False,
+                    error="unknown_tool",
+                    message=f"Unknown tool {call.name!r}.",
+                ),
+                None,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            error = (
+                "no_frame"
+                if message.startswith("Call view_board")
+                else "invalid_arguments"
+            )
+            return (
+                ToolResult(ok=False, error=error, message=message),
+                None,
+            )
+        except Exception as exc:
+            return (
+                ToolResult(
+                    ok=False,
+                    error="tool_failed",
+                    message=str(exc),
+                ),
+                None,
+            )
 
     def run(self) -> LoopResult:
         stopped = "max_steps"
@@ -374,19 +609,19 @@ class HarnessLoop:
                 printer = ThinkingPrinter()
                 try:
                     turn = self.agent.complete(
-                        self.messages, on_thinking=printer.write
+                        self.messages,
+                        tools=tool_schemas(include_note=self.notes is not None),
+                        on_thinking=printer.write,
                     )
                 finally:
                     printer.close()
+
                 self.recorder.log_turn(step, turn)
-                if turn.thinking:
-                    if not printer.started:
-                        if self.config.show_thinking:
-                            print(textwrap.indent(turn.thinking.strip(), "  "))
-                        else:
-                            print(
-                                f"  thinking saved -> thinking/{step:04d}.txt"
-                            )
+                if turn.thinking and not printer.started:
+                    if self.config.show_thinking:
+                        print(textwrap.indent(turn.thinking.strip(), "  "))
+                    else:
+                        print(f"  thinking saved -> thinking/{step:04d}.txt")
                 if turn.usage:
                     cached = turn.usage.get("cached_tokens")
                     prompt_tokens = turn.usage.get("prompt_tokens")
@@ -396,64 +631,49 @@ class HarnessLoop:
                             f"{prompt_tokens if prompt_tokens is not None else '?'} "
                             "prompt tokens"
                         )
-                self.messages.append(
-                    {"role": "assistant", "content": turn.content}
-                )
 
-                try:
-                    actions = parse_point_actions(turn.content or "")
-                except PointParseError as exc:
-                    print(f"  parse error: {exc}")
-                    preview = _preview(turn.content)
-                    if preview:
-                        print(f"  model: {preview}")
-                    self.messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Your response could not be parsed: {exc} "
-                                "Return only a JSON array like "
-                                '[{"point_2d": [500, 250], "label": "click"}].'
-                            ),
-                        }
-                    )
-                    continue
+                self.messages.append(_assistant_message(turn))
 
-                if not actions:
-                    preview = _preview(turn.content)
-                    if preview and preview != "[]":
-                        print(f"  model: {preview}")
-                    print("  model returned no actions; stopping")
+                if not turn.tool_calls:
+                    print("  model returned no tool call; stopping")
                     stopped = "model_stopped"
                     final_text = turn.content
                     break
 
-                if len(actions) > self.config.max_actions_per_turn:
-                    print(
-                        f"  parse error: {len(actions)} actions exceeds "
-                        f"limit {self.config.max_actions_per_turn}"
+                primary = turn.tool_calls[0]
+                for extra in turn.tool_calls[1:]:
+                    extra_result = ToolResult(
+                        ok=False,
+                        error="one_tool_per_turn",
+                        message="Call exactly one tool per turn.",
                     )
                     self.messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                f"Return at most "
-                                f"{self.config.max_actions_per_turn} actions "
-                                "in one list."
-                            ),
-                        }
+                        extra_result.as_tool_message(extra.id, extra.name)
                     )
-                    continue
+                    self.recorder.log_tool_call(
+                        step,
+                        extra,
+                        extra_result,
+                        None,
+                        self.last_frame_path,
+                    )
 
-                outcomes, next_frame_path = self._execute_actions(step, actions)
+                source_frame = self.last_frame_path
+                result, next_frame = self._execute_tool(primary)
                 self.messages.append(
-                    _user_image_message(
-                        self.frame,
-                        f"Processed {len(outcomes)} input(s). "
-                        "Here is the resulting screenshot. Return the next "
-                        "JSON list of point actions.",
-                    )
+                    result.as_tool_message(primary.id, primary.name)
                 )
+                self.recorder.log_tool_call(
+                    step, primary, result, next_frame, source_frame
+                )
+
+                if result.ok:
+                    print(f"  tool {primary.name}: {result.message}")
+                else:
+                    print(
+                        f"  tool {primary.name}: error={result.error} "
+                        f"{result.message}"
+                    )
                 self._prune_images()
         except KeyboardInterrupt:
             stopped = "interrupted"
@@ -470,31 +690,36 @@ class HarnessLoop:
         )
 
 
-def _fmt_number(value: float) -> str:
-    return str(int(value)) if float(value).is_integer() else f"{value:.1f}"
-
-
-def _preview(text: str | None, limit: int = 180) -> str:
-    if not text:
-        return ""
-    single_line = " ".join(text.split())
-    if len(single_line) <= limit:
-        return single_line
-    return single_line[: limit - 3].rstrip() + "..."
-
-
-def _user_image_message(frame: Frame, text: str) -> dict[str, Any]:
-    encoded = base64.b64encode(frame.png).decode("ascii")
-    return {
-        "role": "user",
-        "content": [
-            {"type": "text", "text": text},
+def _assistant_message(turn: ModelTurn) -> dict[str, Any]:
+    tool_calls = []
+    for call in turn.tool_calls:
+        arguments = call.arguments
+        if not isinstance(arguments, str):
+            arguments = json.dumps(_jsonable(arguments))
+        tool_calls.append(
             {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{encoded}"},
-            },
-        ],
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": arguments},
+            }
+        )
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": turn.content,
     }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return message
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return repr(value)
 
 
 def _resolve_target(backend: CaptureBackend, spec: str) -> WindowInfo:
@@ -504,7 +729,7 @@ def _resolve_target(backend: CaptureBackend, spec: str) -> WindowInfo:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="itb-agent",
-        description="Run the observer/act loop for Into the Breach.",
+        description="Run the tool-driven observer/act loop.",
     )
     parser.add_argument(
         "--backend", default="auto", help="Capture backend: auto, kwin, x11."
@@ -529,19 +754,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--steps",
         type=int,
         default=20,
-        help="Maximum model turns (default: 20).",
-    )
-    parser.add_argument(
-        "--max-actions",
-        type=int,
-        default=12,
-        help="Maximum point actions per model turn (default: 12).",
-    )
-    parser.add_argument(
-        "--action-delay",
-        type=float,
-        default=0.15,
-        help="Seconds to wait after each click/hover (default: 0.15).",
+        help="Maximum model turns/tool calls (default: 20).",
     )
     parser.add_argument(
         "--max-images",
@@ -551,6 +764,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Screenshots kept in conversation history; 0 keeps everything "
             "(better prompt-cache reuse, larger context)."
         ),
+    )
+    parser.add_argument(
+        "--action-delay",
+        type=float,
+        default=0.15,
+        help="Seconds to wait after clicks, keys, and hovers (default: 0.15).",
     )
     parser.add_argument(
         "--stream",
@@ -565,6 +784,23 @@ def build_parser() -> argparse.ArgumentParser:
             "With --no-stream, print the saved thinking after the response. "
             "Streaming mode already prints it live."
         ),
+    )
+    parser.add_argument(
+        "--notes",
+        action="store_true",
+        help="Enable the optional note tool and load persistent notes.",
+    )
+    parser.add_argument(
+        "--notes-file",
+        type=Path,
+        default=Path("notes.md"),
+        help="Persistent notes file (default: notes.md).",
+    )
+    parser.add_argument(
+        "--notes-max-chars",
+        type=int,
+        default=6000,
+        help="Maximum note characters loaded into the prompt (default: 6000).",
     )
     parser.add_argument(
         "--cache-key",
@@ -633,16 +869,26 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: could not initialize model client: {exc}", file=sys.stderr)
             return 2
 
+        notes = (
+            NotesStore(
+                args.notes_file.expanduser(),
+                max_chars=args.notes_max_chars,
+            )
+            if args.notes
+            else None
+        )
+
         config = LoopConfig(
             max_steps=max(1, args.steps),
-            max_actions_per_turn=max(1, args.max_actions),
             max_images=args.max_images,
             action_delay=max(0.0, args.action_delay),
             show_thinking=args.show_thinking,
             out_dir=args.out.expanduser(),
             model=agent.model,
         )
-        loop = HarnessLoop(backend, target, agent, input_backend, config)
+        loop = HarnessLoop(
+            backend, target, agent, input_backend, config, notes=notes
+        )
         try:
             result = loop.run()
         except Exception as exc:
@@ -650,7 +896,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(
             f"\nStopped: {result.stopped}  steps={result.steps}  "
-            f"actions={result.actions}  frames={result.frames}"
+            f"clicks={result.actions}  frames={result.frames}"
         )
         print(f"Run output: {result.run_dir}")
         return 0

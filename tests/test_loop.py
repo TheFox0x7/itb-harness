@@ -6,10 +6,16 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from itb_harness.agent import MistralAgent, ModelTurn, ScriptedAgent
+from itb_harness.agent import (
+    MistralAgent,
+    ModelToolCall,
+    ModelTurn,
+    ScriptedAgent,
+)
 from itb_harness.capture import Frame, MonitorInfo, WindowInfo
-from itb_harness.input import StubInput
+from itb_harness.input import InputEvent, StubInput
 from itb_harness.loop import HarnessLoop, LoopConfig
+from itb_harness.notes import NotesStore
 
 
 WINDOW = WindowInfo(
@@ -52,7 +58,7 @@ class FakeBackend:
             png=f"frame-{self.captures}".encode(),
             width=self.window.width,
             height=self.window.height,
-            captured_at="2026-10-21T00:00:00+00:00",
+            captured_at="2026-10-22T00:00:00+00:00",
             latency_ms=1.0,
         )
 
@@ -75,13 +81,17 @@ class FakeMistralClient:
         )
 
 
+def call(name: str, arguments: dict | None = None, id: str = "call-1"):
+    return ModelToolCall(id=id, name=name, arguments=arguments or {})
+
+
 def run_loop(
     turns: list[ModelTurn],
     tmp: Path,
     max_steps: int = 5,
     max_images: int = 4,
-    max_actions: int = 12,
     action_delay: float = 0.0,
+    notes: NotesStore | None = None,
 ) -> tuple[HarnessLoop, object, StubInput]:
     backend = FakeBackend()
     agent = ScriptedAgent(turns)
@@ -94,93 +104,218 @@ def run_loop(
         LoopConfig(
             max_steps=max_steps,
             max_images=max_images,
-            max_actions_per_turn=max_actions,
             action_delay=action_delay,
             out_dir=tmp,
         ),
+        notes=notes,
     )
     result = loop.run()
     return loop, result, pointer
 
 
 class LoopTests(unittest.TestCase):
-    def test_actions_are_executed_in_order_and_capture_once(self) -> None:
+    def test_view_click_view_flow(self) -> None:
         turns = [
-            ModelTurn(
-                content=(
-                    '[{"point_2d": [500, 500], "label": "click"},'
-                    ' {"point_2d": [250, 750], "label": "hover"}]'
-                )
-            ),
-            ModelTurn(content="[]"),
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("click", {"point_2d": [960, 540]}),)),
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(content="done"),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             loop, result, pointer = run_loop(turns, Path(tmp))
-            self.assertEqual(result.steps, 2)
-            self.assertEqual(result.actions, 2)
+            self.assertEqual(result.steps, 4)
+            self.assertEqual(result.actions, 1)
             self.assertEqual(result.frames, 2)
             self.assertEqual(result.stopped, "model_stopped")
             self.assertEqual(
                 [(event.kind, event.x, event.y) for event in pointer.events],
-                [
-                    ("click", 960, 540),
-                    ("hover", 480, 809),
-                ],
+                [("click", 960, 540)],
             )
             records = [
                 json.loads(line)
                 for line in (result.run_dir / "actions.jsonl").read_text().splitlines()
             ]
-            self.assertEqual([record["label"] for record in records], ["click", "hover"])
-            self.assertTrue(all(record["ok"] for record in records))
-            self.assertEqual(records[0]["next_frame"], "frames/0002.png")
+            self.assertEqual(
+                [record["tool"] for record in records],
+                ["view_board", "click", "view_board"],
+            )
+            self.assertEqual(records[0]["frame"], "frames/0001.png")
+            self.assertIsNone(records[1]["frame"])
+            self.assertEqual(records[1]["source_frame"], "frames/0001.png")
+            self.assertEqual(records[2]["frame"], "frames/0002.png")
 
-    def test_parse_error_does_not_click_or_recapture(self) -> None:
-        turns = [ModelTurn(content="not json"), ModelTurn(content="[]")]
-        with tempfile.TemporaryDirectory() as tmp:
-            loop, result, pointer = run_loop(turns, Path(tmp))
-            self.assertEqual(result.actions, 0)
-            self.assertEqual(result.frames, 1)
-            self.assertEqual(pointer.events, [])
-            self.assertEqual(result.steps, 2)
-
-    def test_empty_list_stops(self) -> None:
-        turns = [ModelTurn(content="[]")]
-        with tempfile.TemporaryDirectory() as tmp:
-            loop, result, pointer = run_loop(turns, Path(tmp))
-            self.assertEqual(result.stopped, "model_stopped")
-            self.assertEqual(result.frames, 1)
-            self.assertEqual(pointer.events, [])
-
-    def test_too_many_actions_are_rejected(self) -> None:
-        content = (
-            '[{"point_2d": [1, 1], "label": "click"},'
-            ' {"point_2d": [2, 2], "label": "click"},'
-            ' {"point_2d": [3, 3], "label": "click"}]'
-        )
-        turns = [ModelTurn(content=content), ModelTurn(content="[]")]
-        with tempfile.TemporaryDirectory() as tmp:
-            loop, result, pointer = run_loop(turns, Path(tmp), max_actions=2)
-            self.assertEqual(result.actions, 0)
-            self.assertEqual(result.frames, 1)
-            self.assertEqual(pointer.events, [])
-
-    def test_history_prunes_old_images(self) -> None:
+    def test_click_before_view_is_rejected(self) -> None:
         turns = [
-            ModelTurn(content='[{"point_2d": [100, 100], "label": "click"}]'),
-            ModelTurn(content='[{"point_2d": [200, 200], "label": "click"}]'),
-            ModelTurn(content='[{"point_2d": [300, 300], "label": "click"}]'),
-            ModelTurn(content="[]"),
+            ModelTurn(tool_calls=(call("click", {"point_2d": [1, 1]}),)),
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(turns, Path(tmp))
+            self.assertEqual(result.actions, 0)
+            self.assertEqual(result.frames, 1)
+            self.assertEqual(pointer.events, [])
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            self.assertFalse(records[0]["ok"])
+            self.assertEqual(records[0]["error"], "no_frame")
+            self.assertIn("view_board", records[0]["message"])
+
+    def test_inspect_hovers_and_captures(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(
+                tool_calls=(call("inspect", {"point_2d": [480, 809]}),)
+            ),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(turns, Path(tmp))
+            self.assertEqual(result.actions, 0)
+            self.assertEqual(result.frames, 2)
+            self.assertEqual(
+                [(event.kind, event.x, event.y) for event in pointer.events],
+                [("hover", 480, 809)],
+            )
+
+    def test_keyboard_and_modifier_tools(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("select_unit", {"number": 1}),)),
+            ModelTurn(tool_calls=(call("weapon", {"number": 2}),)),
+            ModelTurn(tool_calls=(call("repair"),)),
+            ModelTurn(
+                tool_calls=(
+                    call(
+                        "inspect",
+                        {"point_2d": [960, 540], "with_details": True},
+                    ),
+                )
+            ),
+            ModelTurn(tool_calls=(call("attack_order"),)),
+            ModelTurn(tool_calls=(call("end_turn"),)),
+            ModelTurn(tool_calls=(call("undo_move"),)),
+            ModelTurn(tool_calls=(call("reset_turn"),)),
+            ModelTurn(tool_calls=(call("cancel"),)),
+            ModelTurn(content="done"),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             loop, result, pointer = run_loop(
-                turns, Path(tmp), max_images=2
+                turns, Path(tmp), max_steps=12
             )
-            self.assertEqual(result.frames, 4)
-            image_messages = [
+            self.assertEqual(result.frames, 3)
+            self.assertEqual(
+                pointer.events,
+                [
+                    InputEvent("key", key="a"),
+                    InputEvent("key", key="2"),
+                    InputEvent("key", key="r"),
+                    InputEvent("hover", 960, 540),
+                    InputEvent("key_down", key="ctrl"),
+                    InputEvent("key_up", key="ctrl"),
+                    InputEvent("key_down", key="alt"),
+                    InputEvent("key_up", key="alt"),
+                    InputEvent("key", key="space"),
+                    InputEvent("key", key="shift"),
+                    InputEvent("key", key="backspace"),
+                    InputEvent("right_click"),
+                ],
+            )
+
+    def test_out_of_bounds_pixel_is_rejected(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("click", {"point_2d": [1920, 10]}),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(turns, Path(tmp))
+            self.assertEqual(pointer.events, [])
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            self.assertFalse(records[1]["ok"])
+            self.assertEqual(records[1]["error"], "invalid_arguments")
+            self.assertIn("outside the screenshot", records[1]["message"])
+
+    def test_invalid_weapon_and_unit_are_rejected(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("weapon", {"number": 3}),)),
+            ModelTurn(tool_calls=(call("select_unit", {"number": 6}),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(turns, Path(tmp))
+            self.assertEqual(pointer.events, [])
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            self.assertFalse(records[0]["ok"])
+            self.assertFalse(records[1]["ok"])
+            self.assertEqual(records[0]["error"], "invalid_arguments")
+            self.assertEqual(records[1]["error"], "invalid_arguments")
+
+    def test_extra_tool_calls_are_rejected(self) -> None:
+        turns = [
+            ModelTurn(
+                tool_calls=(
+                    call("view_board", id="1"),
+                    call("view_board", id="2"),
+                )
+            ),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(turns, Path(tmp))
+            self.assertEqual(result.frames, 1)
+            tool_messages = [
                 message
                 for message in loop.messages
-                if message.get("role") == "user"
+                if message.get("role") == "tool"
+            ]
+            self.assertEqual(len(tool_messages), 2)
+            self.assertIn("one_tool_per_turn", str(tool_messages[0]["content"]))
+
+    def test_thinking_is_saved_even_when_not_printed(self) -> None:
+        turns = [
+            ModelTurn(
+                content="done",
+                thinking="The mech is exposed on the left.",
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(turns, Path(tmp))
+            thinking_file = result.run_dir / "thinking" / "0001.txt"
+            self.assertEqual(
+                thinking_file.read_text(),
+                "The mech is exposed on the left.",
+            )
+            record = json.loads(
+                (result.run_dir / "conversation.jsonl")
+                .read_text()
+                .splitlines()[0]
+            )
+            self.assertEqual(record["thinking"], "The mech is exposed on the left.")
+            self.assertEqual(pointer.events, [])
+
+    def test_history_prunes_old_tool_images(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("view_board", id="1"),)),
+            ModelTurn(tool_calls=(call("view_board", id="2"),)),
+            ModelTurn(tool_calls=(call("view_board", id="3"),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(turns, Path(tmp), max_images=2)
+            self.assertEqual(result.frames, 3)
+            image_tool_messages = [
+                message
+                for message in loop.messages
+                if message.get("role") == "tool"
                 and isinstance(message.get("content"), list)
                 and any(
                     chunk.get("type") == "image_url"
@@ -188,20 +323,51 @@ class LoopTests(unittest.TestCase):
                     if isinstance(chunk, dict)
                 )
             ]
-            self.assertLessEqual(len(image_messages), 2)
+            self.assertLessEqual(len(image_tool_messages), 2)
 
-    def test_mistral_adapter_does_not_force_tools(self) -> None:
-        client = FakeMistralClient(
-            content='[{"point_2d": [1, 2], "label": "click"}]'
-        )
+    def test_note_tool_persists_for_future_runs(self) -> None:
+        turns = [
+            ModelTurn(
+                tool_calls=(
+                    call(
+                        "note",
+                        {"text": "Firefly: attacks in a line; use a shield."},
+                    ),
+                )
+            ),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            notes_path = Path(tmp) / "notes.md"
+            notes = NotesStore(notes_path)
+            loop, result, pointer = run_loop(
+                turns, Path(tmp), notes=notes
+            )
+            self.assertEqual(result.frames, 0)
+            self.assertEqual(result.actions, 0)
+            saved = notes_path.read_text()
+            self.assertIn("Firefly", saved)
+            self.assertIn("shield", saved)
+
+    def test_prior_notes_are_loaded_into_system_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            notes_path = Path(tmp) / "notes.md"
+            notes = NotesStore(notes_path)
+            notes.append("Old fact: the train mission is fragile.", run_id="old")
+            loop, result, pointer = run_loop(
+                [ModelTurn(content="done")], Path(tmp), notes=notes
+            )
+            system = loop.messages[0]
+            self.assertEqual(system["role"], "system")
+            self.assertIn("Old fact: the train mission is fragile.", system["content"])
+            self.assertIn("Persistent notes from previous runs", system["content"])
+
+    def test_mistral_adapter_does_not_force_tools_when_none(self) -> None:
+        client = FakeMistralClient(content="hello")
         agent = MistralAgent(model="test", client=client)
         turn = agent.complete([], None)
-        self.assertEqual(
-            turn.content, '[{"point_2d": [1, 2], "label": "click"}]'
-        )
-        self.assertEqual(turn.tool_calls, ())
+        self.assertEqual(turn.content, "hello")
         self.assertNotIn("tools", client.requests[0])
-        self.assertNotIn("tool_choice", client.requests[0])
         self.assertTrue(client.requests[0]["prompt_cache_key"])
 
     def test_mistral_streams_thinking_and_accumulates_content(self) -> None:
@@ -249,9 +415,7 @@ class LoopTests(unittest.TestCase):
                 return iter(events)
 
         client = StreamingClient()
-        agent = MistralAgent(
-            model="test", client=client, stream=True
-        )
+        agent = MistralAgent(model="test", client=client, stream=True)
         chunks: list[str] = []
         turn = agent.complete([], None, on_thinking=chunks.append)
         self.assertEqual(chunks, ["look ", "left"])
@@ -260,60 +424,47 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(turn.usage["cached_tokens"], 0)
         self.assertIn("prompt_cache_key", client.requests[0])
 
-    def test_mistral_reuses_prompt_cache_key_and_reads_cached_tokens(self) -> None:
-        usage = SimpleNamespace(
-            prompt_tokens=100,
-            completion_tokens=5,
-            total_tokens=105,
-            prompt_tokens_details=SimpleNamespace(cached_tokens=64),
-        )
-        client = FakeMistralClient(content="[]", usage=usage)
-        agent = MistralAgent(
-            model="test", client=client, prompt_cache_key="test-run"
-        )
-        first = agent.complete([], None)
-        second = agent.complete([], None)
-        self.assertEqual(first.usage["cached_tokens"], 64)
-        self.assertEqual(second.usage["prompt_tokens"], 100)
-        self.assertEqual(
-            client.requests[0]["prompt_cache_key"],
-            client.requests[1]["prompt_cache_key"],
-        )
-        self.assertEqual(client.requests[0]["prompt_cache_key"], "test-run")
+    def test_mistral_streams_tool_call_deltas(self) -> None:
+        def event(tool_calls=None):
+            return SimpleNamespace(
+                data=SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(
+                                content=None, tool_calls=tool_calls
+                            )
+                        )
+                    ],
+                    usage=None,
+                )
+            )
 
-    def test_thinking_is_saved_even_when_not_printed(self) -> None:
-        turns = [
-            ModelTurn(content="[]", thinking="The mech is exposed on the left.")
+        def tool_delta(index, call_id, name, arguments):
+            return SimpleNamespace(
+                index=index,
+                id=call_id,
+                function=SimpleNamespace(name=name, arguments=arguments),
+            )
+
+        events = [
+            event([tool_delta(0, "call-1", "view_board", "{")]),
+            event([tool_delta(0, None, None, "}")]),
         ]
-        with tempfile.TemporaryDirectory() as tmp:
-            loop, result, pointer = run_loop(turns, Path(tmp))
-            thinking_file = result.run_dir / "thinking" / "0001.txt"
-            self.assertEqual(
-                thinking_file.read_text(),
-                "The mech is exposed on the left.",
-            )
-            record = json.loads(
-                (result.run_dir / "conversation.jsonl")
-                .read_text()
-                .splitlines()[0]
-            )
-            self.assertEqual(record["thinking"], "The mech is exposed on the left.")
-            self.assertEqual(pointer.events, [])
 
-    def test_mistral_adapter_splits_thinking_from_content(self) -> None:
-        client = FakeMistralClient(
-            content=[
-                {
-                    "type": "thinking",
-                    "thinking": [{"type": "text", "text": "reasoning"}],
-                },
-                {"type": "text", "text": "[]"},
-            ]
+        class StreamingClient:
+            def __init__(self) -> None:
+                self.chat = SimpleNamespace(stream=self._stream)
+
+            def _stream(self, **kwargs):
+                return iter(events)
+
+        agent = MistralAgent(
+            model="test", client=StreamingClient(), stream=True
         )
-        agent = MistralAgent(model="test", client=client)
-        turn = agent.complete([], None)
-        self.assertEqual(turn.content, "[]")
-        self.assertEqual(turn.thinking, "reasoning")
+        turn = agent.complete([], [{"type": "function"}])
+        self.assertEqual(len(turn.tool_calls), 1)
+        self.assertEqual(turn.tool_calls[0].name, "view_board")
+        self.assertEqual(turn.tool_calls[0].arguments, {})
 
 
 if __name__ == "__main__":
