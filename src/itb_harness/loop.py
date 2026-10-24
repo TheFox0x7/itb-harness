@@ -18,18 +18,20 @@ import json
 import sys
 import textwrap
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .agent import ChatAgent, MistralAgent, ModelToolCall, ModelTurn
+from .annotate import annotate_click
 from .board_tools import (
     parse_inspect_args,
     parse_note_args,
     parse_point_args,
     parse_select_unit_args,
     parse_weapon_args,
+    normalized_to_pixels,
     tool_schemas,
 )
 from .capture import (
@@ -56,19 +58,17 @@ You do not receive screenshots automatically. Use the tools supplied with the
 request:
 
 - view_board: capture and return the current game screenshot.
-- click: move to a screenshot pixel coordinate and left-click.
-- inspect: hover at a screenshot pixel coordinate, wait briefly, then capture
-  and return a screenshot. Use with_details=true to hold Left Ctrl for
-  detailed tooltips.
+- click: move to a __POINT__ and left-click. Returns a screenshot with the
+  click position marked.
+- inspect: hover at a __POINT__, wait briefly, then capture and return a
+  screenshot. Use with_details=true to hold Left Ctrl for detailed tooltips.
 - attack_order: hold Left Alt and capture the attack-order preview.
 - repair: press R to activate repair mode, then click the selected mech.
 - weapon: press 1 or 2 to select a weapon, then click the target.
 - select_unit: select unit 1-5 (A/S/D/Z/X).
 - end_turn, undo_move, reset_turn, cancel: turn and cancellation controls.
 
-Coordinates are [x, y] in screenshot pixels, with (0, 0) at the top-left and
-the bottom-right at (width - 1, height - 1). Use the dimensions reported by
-view_board. Call view_board before your first click, and call view_board again
+__COORDS__ Call view_board before your first click, and call view_board again
 after a click when you need to see the result. Inspect before committing an
 attack when you are unsure of the result.
 
@@ -96,12 +96,33 @@ You lose the game it it reaches 0 bars. Grid defense is a chance to mitigate the
 """
 
 
+def build_system_prompt(normalized: bool) -> str:
+    point = (
+        "normalized coordinate in the range 0..1000"
+        if normalized
+        else "screenshot pixel coordinate"
+    )
+    coords = (
+        "Coordinates are [x, y] normalized from 0 to 1000, with (0, 0) at "
+        "the top-left and (1000, 1000) at the bottom-right."
+        if normalized
+        else "Coordinates are [x, y] in screenshot pixels, with (0, 0) at "
+        "the top-left and the bottom-right at (width - 1, height - 1). Use "
+        "the dimensions reported by view_board."
+    )
+    return SYSTEM_PROMPT.replace("__POINT__", point).replace(
+        "__COORDS__", coords
+    )
+
+
 @dataclass(slots=True)
 class LoopConfig:
     max_steps: int = 20
     max_images: int = 4
     action_delay: float = 0.15
     show_thinking: bool = False
+    normalized_coordinates: bool = False
+    console: bool = True
     out_dir: Path = field(default_factory=lambda: Path("runs"))
     model: str = "mistral-large-4"
 
@@ -151,6 +172,7 @@ class Recorder:
                     "model": model,
                     "prompt_cache_key": cache_key,
                     "notes_file": str(notes.path) if notes is not None else None,
+                    "normalized_coordinates": config.normalized_coordinates,
                     "max_steps": config.max_steps,
                     "max_images": config.max_images,
                     "action_delay": config.action_delay,
@@ -209,6 +231,7 @@ class Recorder:
             "error": result.error,
             "message": result.message,
             "state_changed": result.state_changed,
+            "pixel": list(result.pixel) if result.pixel is not None else None,
             "frame": (
                 str(frame_path.relative_to(self.root))
                 if frame_path is not None
@@ -231,11 +254,12 @@ class Recorder:
 class ThinkingPrinter:
     """Stream reasoning chunks to the terminal as they arrive."""
 
-    def __init__(self) -> None:
+    def __init__(self, enabled: bool = True) -> None:
+        self.enabled = enabled
         self.started = False
 
     def write(self, text: str) -> None:
-        if not text:
+        if not self.enabled or not text:
             return
         if not self.started:
             print("  thinking:", flush=True)
@@ -280,15 +304,19 @@ class HarnessLoop:
         self.frame: Frame | None = None
         self.last_frame_path: Path | None = None
         self.action_count = 0
+        self.step_index = 0
+        self.final_text: str | None = None
+        self._closed = False
 
-        print(f"Target  [{target.monitor or '?'}] {target.label}")
-        print(f"Capture {backend.name}")
-        print(f"Input   {input_backend.name}")
-        if notes is not None:
-            print(f"Notes   {notes.path} ({notes.char_count} chars loaded)")
-        print(f"Output  {self.recorder.root}")
+        if self.config.console:
+            print(f"Target  [{target.monitor or '?'}] {target.label}")
+            print(f"Capture {backend.name}")
+            print(f"Input   {input_backend.name}")
+            if notes is not None:
+                print(f"Notes   {notes.path} ({notes.char_count} chars loaded)")
+            print(f"Output  {self.recorder.root}")
 
-        system_prompt = SYSTEM_PROMPT
+        system_prompt = build_system_prompt(self.config.normalized_coordinates)
         if notes is not None:
             rendered_notes = notes.render_for_prompt()
             if rendered_notes:
@@ -310,12 +338,13 @@ class HarnessLoop:
         self.frame = frame
         path = self.recorder.save_frame(frame)
         self.last_frame_path = path
-        print(
-            f"  frame {self.recorder.frame_index:04d}  "
-            f"{frame.width}x{frame.height}  "
-            f"[{frame.window.monitor or '?'}]  "
-            f"{path.relative_to(self.recorder.root)}"
-        )
+        if self.config.console:
+            print(
+                f"  frame {self.recorder.frame_index:04d}  "
+                f"{frame.width}x{frame.height}  "
+                f"[{frame.window.monitor or '?'}]  "
+                f"{path.relative_to(self.recorder.root)}"
+            )
         return frame
 
     def _prune_images(self) -> None:
@@ -401,28 +430,49 @@ class HarnessLoop:
 
             if call.name == "click":
                 frame = self._require_frame()
-                x, y = parse_point_args(call.arguments)
+                x, y = parse_point_args(
+                    call.arguments,
+                    normalized=self.config.normalized_coordinates,
+                )
+                if self.config.normalized_coordinates:
+                    x, y = normalized_to_pixels(x, y, frame.width, frame.height)
+                else:
+                    x, y = int(round(x)), int(round(y))
                 self._validate_point(frame, x, y)
                 sx = frame.window.x + x
                 sy = frame.window.y + y
                 self.input.click(sx, sy)
                 self.action_count += 1
                 self._pause()
+                frame = self._capture()
+                marked_png = annotate_click(frame.png, x, y)
+                self.last_frame_path.write_bytes(marked_png)
+                self.frame = replace(frame, png=marked_png)
                 return (
                     ToolResult(
                         ok=True,
                         message=(
                             f"Clicked screenshot pixel ({x}, {y}) "
-                            f"at screen ({sx}, {sy})."
+                            f"at screen ({sx}, {sy}). Marked screenshot "
+                            f"attached ({frame.width}x{frame.height})."
                         ),
+                        image_png=marked_png,
                         state_changed=True,
+                        pixel=(x, y),
                     ),
-                    None,
+                    self.last_frame_path,
                 )
 
             if call.name == "inspect":
                 frame = self._require_frame()
-                x, y, with_details = parse_inspect_args(call.arguments)
+                x, y, with_details = parse_inspect_args(
+                    call.arguments,
+                    normalized=self.config.normalized_coordinates,
+                )
+                if self.config.normalized_coordinates:
+                    x, y = normalized_to_pixels(x, y, frame.width, frame.height)
+                else:
+                    x, y = int(round(x)), int(round(y))
                 self._validate_point(frame, x, y)
                 sx = frame.window.x + x
                 sy = frame.window.y + y
@@ -445,6 +495,7 @@ class HarnessLoop:
                             + (" with details." if with_details else ".")
                         ),
                         image_png=frame.png,
+                        pixel=(x, y),
                     ),
                     self.last_frame_path,
                 )
@@ -598,96 +649,119 @@ class HarnessLoop:
                 None,
             )
 
-    def run(self) -> LoopResult:
+    def step_once(self) -> bool:
+        """Run one model turn and at most one tool call.
+
+        Returns False when the model stops calling tools.
+        """
+
+        self.step_index += 1
+        step = self.step_index
+        if self.config.console:
+            print(f"\n[turn {step}]")
+        printer = ThinkingPrinter(enabled=self.config.console)
+        try:
+            turn = self.agent.complete(
+                self.messages,
+                tools=tool_schemas(
+                    include_note=self.notes is not None,
+                    normalized=self.config.normalized_coordinates,
+                ),
+                on_thinking=printer.write,
+            )
+        finally:
+            printer.close()
+
+        self.recorder.log_turn(step, turn)
+        if self.config.console and turn.thinking and not printer.started:
+            if self.config.show_thinking:
+                print(textwrap.indent(turn.thinking.strip(), "  "))
+            else:
+                print(f"  thinking saved -> thinking/{step:04d}.txt")
+        if self.config.console and turn.usage:
+            cached = turn.usage.get("cached_tokens")
+            prompt_tokens = turn.usage.get("prompt_tokens")
+            if cached is not None:
+                print(
+                    f"  cache: {cached}/"
+                    f"{prompt_tokens if prompt_tokens is not None else '?'} "
+                    "prompt tokens"
+                )
+
+        self.messages.append(_assistant_message(turn))
+
+        if not turn.tool_calls:
+            if self.config.console:
+                print("  model returned no tool call; stopping")
+            self.final_text = turn.content
+            return False
+
+        primary = turn.tool_calls[0]
+        for extra in turn.tool_calls[1:]:
+            extra_result = ToolResult(
+                ok=False,
+                error="one_tool_per_turn",
+                message="Call exactly one tool per turn.",
+            )
+            self.messages.append(
+                extra_result.as_tool_message(extra.id, extra.name)
+            )
+            self.recorder.log_tool_call(
+                step,
+                extra,
+                extra_result,
+                None,
+                self.last_frame_path,
+            )
+
+        source_frame = self.last_frame_path
+        result, next_frame = self._execute_tool(primary)
+        self.messages.append(
+            result.as_tool_message(primary.id, primary.name)
+        )
+        self.recorder.log_tool_call(
+            step, primary, result, next_frame, source_frame
+        )
+
+        if self.config.console:
+            if result.ok:
+                print(f"  tool {primary.name}: {result.message}")
+            else:
+                print(
+                    f"  tool {primary.name}: error={result.error} "
+                    f"{result.message}"
+                )
+        self._prune_images()
+        return True
+
+    def run(self, max_steps: int | None = None) -> LoopResult:
+        limit = self.config.max_steps if max_steps is None else max_steps
         stopped = "max_steps"
-        final_text: str | None = None
-        step = 0
 
         try:
-            for step in range(1, self.config.max_steps + 1):
-                print(f"\n[turn {step}/{self.config.max_steps}]")
-                printer = ThinkingPrinter()
-                try:
-                    turn = self.agent.complete(
-                        self.messages,
-                        tools=tool_schemas(include_note=self.notes is not None),
-                        on_thinking=printer.write,
-                    )
-                finally:
-                    printer.close()
-
-                self.recorder.log_turn(step, turn)
-                if turn.thinking and not printer.started:
-                    if self.config.show_thinking:
-                        print(textwrap.indent(turn.thinking.strip(), "  "))
-                    else:
-                        print(f"  thinking saved -> thinking/{step:04d}.txt")
-                if turn.usage:
-                    cached = turn.usage.get("cached_tokens")
-                    prompt_tokens = turn.usage.get("prompt_tokens")
-                    if cached is not None:
-                        print(
-                            f"  cache: {cached}/"
-                            f"{prompt_tokens if prompt_tokens is not None else '?'} "
-                            "prompt tokens"
-                        )
-
-                self.messages.append(_assistant_message(turn))
-
-                if not turn.tool_calls:
-                    print("  model returned no tool call; stopping")
+            while limit is None or limit <= 0 or self.step_index < limit:
+                if not self.step_once():
                     stopped = "model_stopped"
-                    final_text = turn.content
                     break
-
-                primary = turn.tool_calls[0]
-                for extra in turn.tool_calls[1:]:
-                    extra_result = ToolResult(
-                        ok=False,
-                        error="one_tool_per_turn",
-                        message="Call exactly one tool per turn.",
-                    )
-                    self.messages.append(
-                        extra_result.as_tool_message(extra.id, extra.name)
-                    )
-                    self.recorder.log_tool_call(
-                        step,
-                        extra,
-                        extra_result,
-                        None,
-                        self.last_frame_path,
-                    )
-
-                source_frame = self.last_frame_path
-                result, next_frame = self._execute_tool(primary)
-                self.messages.append(
-                    result.as_tool_message(primary.id, primary.name)
-                )
-                self.recorder.log_tool_call(
-                    step, primary, result, next_frame, source_frame
-                )
-
-                if result.ok:
-                    print(f"  tool {primary.name}: {result.message}")
-                else:
-                    print(
-                        f"  tool {primary.name}: error={result.error} "
-                        f"{result.message}"
-                    )
-                self._prune_images()
         except KeyboardInterrupt:
             stopped = "interrupted"
         finally:
-            self.recorder.close()
+            self.close()
 
         return LoopResult(
-            steps=step,
+            steps=self.step_index,
             actions=self.action_count,
             frames=self.recorder.frame_index,
             run_dir=self.recorder.root,
             stopped=stopped,
-            final_text=final_text,
+            final_text=self.final_text,
         )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.recorder.close()
 
 
 def _assistant_message(turn: ModelTurn) -> dict[str, Any]:
@@ -754,7 +828,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--steps",
         type=int,
         default=20,
-        help="Maximum model turns/tool calls (default: 20).",
+        help=(
+            "Headless maximum model turns/tool calls (default: 20). "
+            "Ignored with --web."
+        ),
+    )
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Start the interactive browser UI instead of running headless.",
+    )
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--normalize-coordinates",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use normalized 0..1000 coordinates for click/inspect instead of "
+            "screenshot pixels (default: pixel coordinates)."
+        ),
     )
     parser.add_argument(
         "--max-images",
@@ -883,12 +976,38 @@ def main(argv: list[str] | None = None) -> int:
             max_images=args.max_images,
             action_delay=max(0.0, args.action_delay),
             show_thinking=args.show_thinking,
+            normalized_coordinates=args.normalize_coordinates,
+            console=not args.web,
             out_dir=args.out.expanduser(),
             model=agent.model,
         )
         loop = HarnessLoop(
             backend, target, agent, input_backend, config, notes=notes
         )
+
+        if args.web:
+            import uvicorn
+
+            from .session import SessionRunner
+            from .web.server import create_app
+
+            runner = SessionRunner(loop)
+            app = create_app(config.out_dir, live=runner)
+            runner.start()
+            print(f"Live UI: http://{args.host}:{args.port}")
+            print("Manual step mode; press Step in the browser to begin.")
+            try:
+                uvicorn.run(
+                    app,
+                    host=args.host,
+                    port=args.port,
+                    log_level="info",
+                )
+            finally:
+                runner.stop()
+                runner.join(timeout=5.0)
+            return 0
+
         try:
             result = loop.run()
         except Exception as exc:

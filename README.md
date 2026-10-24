@@ -82,6 +82,64 @@ runs/<timestamp>/
 The target window is held for the session; its backend identifier is
 revalidated before each capture and the run fails if the window closes.
 
+## Replay viewer
+
+`itb-web` serves recorded runs from a `runs/` directory:
+
+```bash
+uv run itb-web --runs runs --port 8000
+# open http://127.0.0.1:8000
+```
+
+The viewer reads `run.json`, `conversation.jsonl`, `actions.jsonl`, and
+`frames/*.png` from each run. It provides:
+
+- run selection
+- per-turn thinking, model text, usage, and tool calls
+- frame thumbnails and previous/next navigation
+- the latest screenshot by default
+- click/hover markers drawn from `click`/`inspect` points
+- live pixel-coordinate readout and crosshair while hovering the image
+- click the image to copy the current `x, y` to the clipboard
+- marker toggle and keyboard left/right frame navigation
+
+It is read-only and binds to `127.0.0.1` by default. It does not control a live
+run yet.
+
+The viewer implementation is in `src/itb_harness/web/server.py` with static
+HTML/CSS/JS under `src/itb_harness/web/static/`.
+
+## Interactive live UI
+
+Start a live session with the browser UI:
+
+```bash
+DISPLAY=:2 XAUTHORITY=/run/user/1000/xauth_... \
+  uv run itb-agent \
+    --backend x11 --window Breach --input x11 \
+    --web --port 8000
+```
+
+Open `http://127.0.0.1:8000`.
+
+The session starts **paused**, so it will not run until you press **Step**.
+Controls:
+
+- **Step** — execute one model turn/tool call, then pause again
+- **Resume** — run continuously until paused or stopped
+- **Pause** — finish the current step, then pause
+- **Stop** — stop after the current step
+- **follow** — keep the browser on the live run and latest frame
+
+There is no predetermined step count in web mode; `--steps` is ignored. The
+live UI reloads tool calls, frames, and timeline data roughly every 600 ms.
+Harness console output is suppressed in web mode; thinking appears in the
+browser after each turn completes. Token-level thinking is still only streamed
+in the terminal when running headless.
+
+The live server also serves the replay UI for all runs under `--out` (default
+`runs/`). `itb-web` remains a read-only replay server for recorded runs.
+
 ## Agent loop
 
 The observer/act loop lives in `src/itb_harness/loop.py` and runs as
@@ -93,7 +151,7 @@ plus an optional persistent-note tool:
 | Tool | Args | Effect |
 |---|---|---|
 | `view_board` | — | Capture and return the current game screenshot |
-| `click` | `point_2d` screenshot pixels | Move the pointer and left-click |
+| `click` | `point_2d` pixels or normalized | Move, left-click, and return a screenshot marked at the click |
 | `inspect` | `point_2d`, optional `with_details` | Hover and capture; `with_details` holds Left Ctrl while capturing |
 | `attack_order` | — | Hold Left Alt and capture the attack-order preview |
 | `repair` | — | Press `R`; then click the selected mech as the repair target |
@@ -105,14 +163,17 @@ plus an optional persistent-note tool:
 | `cancel` | — | Right-click |
 | `note` | `text` | Append a note for future runs (only with `--notes`) |
 
-Coordinates are `[x, y]` in screenshot pixels, origin top-left; the valid
-range is `0..width-1` by `0..height-1`. `view_board` reports the screenshot
-dimensions. `repair`, `weapon`, and `select_unit` operate on the current UI
-selection; select mechs and weapons with clicks or the unit keys.
+Coordinates default to `[x, y]` in screenshot pixels, origin top-left; the
+valid range is `0..width-1` by `0..height-1`. `view_board` reports the
+screenshot dimensions. Pass `--normalize-coordinates` to switch click/inspect
+points to normalized `0..1000` values instead; use `--no-normalize-coordinates`
+to return to pixels. `repair`, `weapon`, and `select_unit` operate on the
+current UI selection; select mechs and weapons with clicks or the unit keys.
 
-`inspect` and `attack_order` return screenshots. `click`, `repair`, `weapon`,
-`select_unit`, `end_turn`, `undo_move`, `reset_turn`, and `cancel` return text
-only; call `view_board` when you need to see the result.
+`click`, `inspect`, and `attack_order` return screenshots. `click` annotates
+the returned frame at the clicked pixel. `repair`, `weapon`, `select_unit`,
+`end_turn`, `undo_move`, `reset_turn`, and `cancel` return text only; call
+`view_board` when you need to see the result.
 
 The model is instructed to call `view_board` first and to call it again after
 an action when it needs to see the result. `inspect` is for tooltips/hover
@@ -130,7 +191,12 @@ DISPLAY=:2 XAUTHORITY=/run/user/1000/xauth_... \
 `--input x11` performs real XTest input on `DISPLAY`; use it with the gamescope
 nested display. `--action-delay` waits after clicks, keys, and hover actions;
 `--max-images` controls how many tool screenshots stay in history (`0` keeps
-everything).
+everything). `--normalize-coordinates` selects normalized 0..1000 points for
+click/inspect; the default is screenshot pixels.
+
+Action logs always include the resolved `pixel` coordinate, so replay/live
+markers work in either coordinate mode even when the model’s arguments are
+normalized.
 
 Enable persistent notes with:
 

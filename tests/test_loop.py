@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+
+from PIL import Image
 
 from itb_harness.agent import (
     MistralAgent,
@@ -16,6 +19,12 @@ from itb_harness.capture import Frame, MonitorInfo, WindowInfo
 from itb_harness.input import InputEvent, StubInput
 from itb_harness.loop import HarnessLoop, LoopConfig
 from itb_harness.notes import NotesStore
+
+
+def tiny_png() -> bytes:
+    buffer = BytesIO()
+    Image.new("RGB", (10, 10), (0, 0, 0)).save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 WINDOW = WindowInfo(
@@ -55,7 +64,7 @@ class FakeBackend:
         self.captures += 1
         return Frame(
             window=self.window,
-            png=f"frame-{self.captures}".encode(),
+            png=tiny_png(),
             width=self.window.width,
             height=self.window.height,
             captured_at="2026-10-22T00:00:00+00:00",
@@ -92,6 +101,7 @@ def run_loop(
     max_images: int = 4,
     action_delay: float = 0.0,
     notes: NotesStore | None = None,
+    normalized: bool = False,
 ) -> tuple[HarnessLoop, object, StubInput]:
     backend = FakeBackend()
     agent = ScriptedAgent(turns)
@@ -105,6 +115,7 @@ def run_loop(
             max_steps=max_steps,
             max_images=max_images,
             action_delay=action_delay,
+            normalized_coordinates=normalized,
             out_dir=tmp,
         ),
         notes=notes,
@@ -125,7 +136,7 @@ class LoopTests(unittest.TestCase):
             loop, result, pointer = run_loop(turns, Path(tmp))
             self.assertEqual(result.steps, 4)
             self.assertEqual(result.actions, 1)
-            self.assertEqual(result.frames, 2)
+            self.assertEqual(result.frames, 3)
             self.assertEqual(result.stopped, "model_stopped")
             self.assertEqual(
                 [(event.kind, event.x, event.y) for event in pointer.events],
@@ -140,9 +151,9 @@ class LoopTests(unittest.TestCase):
                 ["view_board", "click", "view_board"],
             )
             self.assertEqual(records[0]["frame"], "frames/0001.png")
-            self.assertIsNone(records[1]["frame"])
+            self.assertEqual(records[1]["frame"], "frames/0002.png")
             self.assertEqual(records[1]["source_frame"], "frames/0001.png")
-            self.assertEqual(records[2]["frame"], "frames/0002.png")
+            self.assertEqual(records[2]["frame"], "frames/0003.png")
 
     def test_click_before_view_is_rejected(self) -> None:
         turns = [
@@ -223,6 +234,27 @@ class LoopTests(unittest.TestCase):
                     InputEvent("right_click"),
                 ],
             )
+
+    def test_normalized_coordinates_are_converted_to_pixels(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("click", {"point_2d": [500, 500]}),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(
+                turns, Path(tmp), normalized=True
+            )
+            self.assertEqual(
+                [(event.kind, event.x, event.y) for event in pointer.events],
+                [("click", 960, 540)],
+            )
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(records[1]["arguments"]["point_2d"], [500, 500])
+            self.assertEqual(records[1]["pixel"], [960, 540])
 
     def test_out_of_bounds_pixel_is_rejected(self) -> None:
         turns = [

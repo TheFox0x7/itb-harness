@@ -7,6 +7,7 @@ an automatic screenshot; it must call view_board/inspect/attack_order.
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -17,7 +18,7 @@ from .tools import ToolResult
 class PointArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    point_2d: list[int] = Field(min_length=2, max_length=2)
+    point_2d: list[float] = Field(min_length=2, max_length=2)
 
 
 class InspectArgs(PointArgs):
@@ -42,37 +43,52 @@ class NoteArgs(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
 
 
-_POINT_PROPERTY = {
-    "type": "array",
-    "items": {"type": "integer", "minimum": 0},
-    "minItems": 2,
-    "maxItems": 2,
-    "description": (
-        "Screenshot pixel [x, y], origin top-left. Must be inside the "
-        "current screenshot dimensions."
-    ),
-}
+def _point_property(normalized: bool) -> dict[str, Any]:
+    if normalized:
+        return {
+            "type": "array",
+            "items": {"type": "number", "minimum": 0, "maximum": 1000},
+            "minItems": 2,
+            "maxItems": 2,
+            "description": (
+                "Normalized [x, y] in 0..1000, origin top-left."
+            ),
+        }
+    return {
+        "type": "array",
+        "items": {"type": "integer", "minimum": 0},
+        "minItems": 2,
+        "maxItems": 2,
+        "description": (
+            "Screenshot pixel [x, y], origin top-left. Must be inside the "
+            "current screenshot dimensions."
+        ),
+    }
 
-_POINT_SCHEMA = {
-    "type": "object",
-    "properties": {"point_2d": _POINT_PROPERTY},
-    "required": ["point_2d"],
-    "additionalProperties": False,
-}
 
-_INSPECT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "point_2d": _POINT_PROPERTY,
-        "with_details": {
-            "type": "boolean",
-            "default": False,
-            "description": "Hold Left Ctrl while capturing to show details.",
+def _point_schema(normalized: bool) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {"point_2d": _point_property(normalized)},
+        "required": ["point_2d"],
+        "additionalProperties": False,
+    }
+
+
+def _inspect_schema(normalized: bool) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "point_2d": _point_property(normalized),
+            "with_details": {
+                "type": "boolean",
+                "default": False,
+                "description": "Hold Left Ctrl while capturing to show details.",
+            },
         },
-    },
-    "required": ["point_2d"],
-    "additionalProperties": False,
-}
+        "required": ["point_2d"],
+        "additionalProperties": False,
+    }
 
 _EMPTY_SCHEMA = {
     "type": "object",
@@ -92,7 +108,9 @@ def _tool(name: str, description: str, parameters: dict[str, Any]) -> dict[str, 
     }
 
 
-def tool_schemas(include_note: bool = False) -> list[dict[str, Any]]:
+def tool_schemas(
+    include_note: bool = False, normalized: bool = False
+) -> list[dict[str, Any]]:
     schemas = [
         _tool(
             "view_board",
@@ -102,17 +120,30 @@ def tool_schemas(include_note: bool = False) -> list[dict[str, Any]]:
         ),
         _tool(
             "click",
-            "Move the pointer to a screenshot pixel coordinate and left-click. "
-            "Does not return a screenshot; call view_board afterwards to "
-            "observe the result.",
-            _POINT_SCHEMA,
+            (
+                "Move the pointer to a normalized 0..1000 coordinate and "
+                "left-click."
+                if normalized
+                else "Move the pointer to a screenshot pixel coordinate and "
+                "left-click."
+            )
+            + " Returns a screenshot with the click position marked, so you "
+            "can see the immediate result.",
+            _point_schema(normalized),
         ),
         _tool(
             "inspect",
-            "Hover at a screenshot pixel coordinate and capture a screenshot. "
-            "Set with_details=true to hold Left Ctrl while capturing detailed "
-            "tooltips. Useful for checking attack results before committing.",
-            _INSPECT_SCHEMA,
+            (
+                "Hover at a normalized 0..1000 coordinate and capture a "
+                "screenshot."
+                if normalized
+                else "Hover at a screenshot pixel coordinate and capture a "
+                "screenshot."
+            )
+            + " Set with_details=true to hold Left Ctrl while capturing "
+            "detailed tooltips. Useful for checking attack results before "
+            "committing.",
+            _inspect_schema(normalized),
         ),
         _tool(
             "attack_order",
@@ -223,29 +254,49 @@ def _load_object(arguments: Any) -> dict[str, Any]:
     return arguments
 
 
-def _point_values(model: PointArgs) -> tuple[int, int]:
+def _point_values(model: PointArgs, normalized: bool) -> tuple[float, float]:
     x, y = model.point_2d
-    if x < 0:
-        raise ValueError(f"x={x} is outside the screenshot.")
-    if y < 0:
-        raise ValueError(f"y={y} is outside the screenshot.")
-    return int(x), int(y)
+    if not math.isfinite(x) or not math.isfinite(y):
+        raise ValueError("Coordinates must be finite numbers.")
+    if normalized:
+        if not 0.0 <= x <= 1000.0:
+            raise ValueError(f"x={x} is outside 0..1000.")
+        if not 0.0 <= y <= 1000.0:
+            raise ValueError(f"y={y} is outside 0..1000.")
+        return float(x), float(y)
+    if x < 0 or y < 0:
+        raise ValueError(f"Point ({x}, {y}) is outside the screenshot.")
+    return float(x), float(y)
 
 
-def parse_point_args(arguments: Any) -> tuple[int, int]:
+def normalized_to_pixels(
+    x: float, y: float, width: int, height: int
+) -> tuple[int, int]:
+    if width <= 0 or height <= 0:
+        raise ValueError("Frame has no drawable area.")
+    px = int(x / 1000.0 * max(width - 1, 0) + 0.5)
+    py = int(y / 1000.0 * max(height - 1, 0) + 0.5)
+    return max(0, min(width - 1, px)), max(0, min(height - 1, py))
+
+
+def parse_point_args(
+    arguments: Any, normalized: bool = False
+) -> tuple[float, float]:
     try:
         parsed = PointArgs.model_validate(_load_object(arguments))
     except ValidationError as exc:
         raise ValueError(_format_validation(exc)) from exc
-    return _point_values(parsed)
+    return _point_values(parsed, normalized)
 
 
-def parse_inspect_args(arguments: Any) -> tuple[int, int, bool]:
+def parse_inspect_args(
+    arguments: Any, normalized: bool = False
+) -> tuple[float, float, bool]:
     try:
         parsed = InspectArgs.model_validate(_load_object(arguments))
     except ValidationError as exc:
         raise ValueError(_format_validation(exc)) from exc
-    x, y = _point_values(parsed)
+    x, y = _point_values(parsed, normalized)
     return x, y, bool(parsed.with_details)
 
 

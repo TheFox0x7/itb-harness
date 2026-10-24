@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ITB Harness Replay</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">ITB Harness <span>Replay</span></div>
+    <select id="run-select" aria-label="Run"></select>
+    <div id="meta" class="meta"></div>
+  </header>
+
+  <div id="live-panel" class="live-panel" hidden>
+    <span class="live-dot"></span>
+    <strong>Live</strong>
+    <span id="live-state" class="live-state">paused</span>
+    <button id="live-step" class="primary">Step</button>
+    <button id="live-resume">Resume</button>
+    <button id="live-pause">Pause</button>
+    <button id="live-stop">Stop</button>
+    <label class="toggle live-follow">
+      <input id="follow-live" type="checkbox" checked>
+      follow
+    </label>
+    <span id="live-error" class="live-error"></span>
+  </div>
+
+  <main class="layout">
+    <section class="viewer">
+      <div class="frame-toolbar">
+        <button id="prev-frame" title="Previous frame">‹</button>
+        <span id="frame-label">No frame</span>
+        <button id="next-frame" title="Next frame">›</button>
+        <span id="coords" class="coords" title="Image pixel coordinates; click image to copy">x=— y=—</span>
+        <label class="toggle">
+          <input id="show-markers" type="checkbox" checked>
+          markers
+        </label>
+      </div>
+
+      <div id="image-stage" class="image-stage">
+        <img id="frame-img" alt="Game screenshot">
+        <canvas id="overlay"></canvas>
+        <div id="empty" class="empty">No screenshots in this run.</div>
+      </div>
+
+      <div id="thumbs" class="thumbs"></div>
+    </section>
+
+    <aside class="timeline-panel">
+      <div class="timeline-head">
+        <h2>Timeline</h2>
+        <span id="turn-count" class="muted"></span>
+      </div>
+      <div id="timeline" class="timeline"></div>
+    </aside>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

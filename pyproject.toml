@@ -8,14 +8,17 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.115",
     "mistralai>=3.3.0",
     "pillow>=11.0",
     "pydantic>=2.0",
+    "uvicorn>=0.30",
 ]
 
 [project.scripts]
 itb-harness = "itb_harness:main"
 itb-agent = "itb_harness.loop:main"
+itb-web = "itb_harness.web:main"
 
 [project.optional-dependencies]
 kde = [

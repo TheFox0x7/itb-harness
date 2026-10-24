@@ -69,6 +69,7 @@ class ActionResult:
     error: str | None = None
     image_png: bytes | None = None
     state_changed: bool = False
+    pixel: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +79,7 @@ class ToolResult:
     error: str | None = None
     image_png: bytes | None = None
     state_changed: bool = False
+    pixel: tuple[int, int] | None = None
 
     @classmethod
     def from_action(cls, result: ActionResult) -> "ToolResult":
@@ -87,6 +89,7 @@ class ToolResult:
             error=result.error,
             image_png=result.image_png,
             state_changed=result.state_changed,
+            pixel=result.pixel,
         )
 
     def payload(self) -> dict[str, Any]:
