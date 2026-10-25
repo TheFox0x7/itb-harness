@@ -1,10 +1,11 @@
 """Main observer/act loop.
 
-The model is not given an automatic screenshot.  It has three tools:
+The model is not given an automatic screenshot.  Its observation tools are:
 
     view_board()          capture and return the board
     click(point_2d)       click at screenshot pixel (x, y)
-    inspect(point_2d)     hover, wait, capture and return a screenshot
+    hover(point_2d)       hover, wait, capture and return a plain screenshot
+    inspect(point_2d)     hover with Left Ctrl, capture detailed tooltips
 
 The loop executes one tool call per model turn, feeds the tool result back, and
 lets the model decide what to do next.
@@ -21,13 +22,12 @@ import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .agent import ChatAgent, MistralAgent, ModelToolCall, ModelTurn
 from .annotate import annotate_click, annotate_grid
 from .grid import IsoGrid, calibrate_grid, default_grid, detect_drop_zone_tiles
 from .board_tools import (
-    parse_inspect_args,
     parse_note_args,
     parse_point_args,
     parse_select_unit_args,
@@ -51,6 +51,19 @@ from .tools import ToolResult
 
 
 UNIT_KEYS = {1: "a", 2: "s", 3: "d", 4: "z", 5: "x"}
+INPUT_TOOLS = {
+    "click",
+    "hover",
+    "inspect",
+    "attack_order",
+    "repair",
+    "weapon",
+    "select_unit",
+    "end_turn",
+    "undo_move",
+    "reset_turn",
+    "cancel",
+}
 
 SYSTEM_PROMPT = """\
 You are controlling the game Into the Breach.
@@ -61,23 +74,42 @@ request:
 - view_board: capture and return the current game screenshot.
 - click: move to a __POINT__ and left-click. Returns a screenshot with the
   click position marked.
-- inspect: hover at a __POINT__, wait briefly, then capture and return a
-  screenshot. Use with_details=true to hold Left Ctrl for detailed tooltips.
+- hover: move to a __POINT__, wait briefly, and capture a screenshot without
+  holding Ctrl. Use this to preview a tile, unit, or target before acting.
+- inspect: hover at a __POINT__ while holding Left Ctrl, then capture and
+  return a screenshot with detailed tooltips. Use this to inspect units,
+  terrain, and predicted attack results.
 - attack_order: hold Left Alt and capture the attack-order preview.
-- repair: press R to activate repair mode, then click the selected mech.
-- weapon: press 1 or 2 to select a weapon, then click the target.
-- select_unit: select unit 1-5 (A/S/D/Z/X).
+- repair: press R to activate repair mode, then hover and click the selected
+  mech.
+- weapon: press 1 or 2 to select a weapon, then hover the target to preview
+  the attack before clicking.
+- select_unit: select unit 1-5 (A/S/D/Z/X), then hover the selected unit to
+  inspect it.
 - end_turn, undo_move, reset_turn, cancel: turn and cancellation controls.
 
 __COORDS__ Call view_board before your first click, and call view_board again
-after a click when you need to see the result. Inspect before committing an
-attack when you are unsure of the result.
+after a click when you need to see the result. Hover before committing an
+attack; use inspect when you need detailed tooltips.
+
+Before the mission you may see the squad selection screen and a difficulty
+dialog. Click the center of the Start button in the top-right, wait for the
+Difficulty Setup dialog, choose a difficulty (Normal is the default), then
+click the Start button in the bottom-right of that dialog. These are UI
+buttons, not board tiles; do not use tile-grid coordinates on menus. If a UI
+click appears to do nothing, call view_board again before clicking again;
+screen transitions can take a moment.
 
 Use exactly one tool per turn. Do not describe an action in prose; call a tool.
 If a tool returns an error, inspect the last screenshot and try a different
 approach. Do not repeat a failed action blindly.
 
-The game has 3 phases:
+Game takes place on 4 islands you'll tackle them one at a time and can move to final game after beating two.
+On the islands there are color coded zones. Red ones you can click and attempt to defend, grey ones are locked.
+Other colors are not interactible.
+To pick a level on an island click a red zone you want to play on then click on the smaller map to start the mission. This will take you to main game loop.
+
+The main game has 3 phases:
 - Deployment where you need to place your units on tan spots. 
 Pay attention to building placements and enemies to try and get early advantage.
 After you deploy all your units click confirm to deploy them. Then the enemy takes it's initial turn.
@@ -87,7 +119,12 @@ Yellow arrow under a unit means the unit will be deployed to that spot. A refres
 
 - Enemy turn. If you see that information in the screenshot you should wait and take another. You can't do anything while enemy takes it's turn.
 - Your turn. Now you get to move your units. Each unit can move and attack in the same turn but an attack ends the turn.
-Units can have multiple abilities to use on the lower bar of the screen. Inspect them to learn more and plan to use the attacks optimally.
+Units can have multiple abilities to use on the lower bar of the screen. Hover or inspect them to learn more and plan to use the attacks optimally.
+If you see red arrows from cracked ground, those are enemy spawn points. Leaving any unit on this spot will block the spawn and deal damage to the unit.
+
+To attack with an unit, choose one of yours then use tool to select a weapon. Red tiles are the range of your weapon, you can hover over them to learn about effects of the attack.
+Some weapons push units around which is indicated with arrows. Weapons may have additional effects as well.
+To move a unit, select it and click any tile marked in lime overlay. You may undo the move at any time before attacking. Hover over the tile to see a preview of the move.
 
 Use notes tool to note down things you learned or misunderstood about instructions so future iterations can be adjusted.
 
@@ -112,8 +149,9 @@ def build_system_prompt(
         "the top-left and (1000, 1000) at the bottom-right."
         if normalized
         else "Coordinates are [x, y] in screenshot pixels, with (0, 0) at "
-        "the top-left and the bottom-right at (width - 1, height - 1). Use "
-        "the dimensions reported by view_board."
+        "the top-left and the bottom-right at (width - 1, height - 1). The "
+        "dimensions reported by view_board are authoritative; never infer "
+        "coordinates from the monitor or window resolution."
     )
     notes: list[str] = []
     if snap_to_tile:
@@ -124,11 +162,13 @@ def build_system_prompt(
         )
     if grid_overlay:
         notes.append(
-            "Every screenshot has a tile grid overlay. Each tile shows its "
-            "pixel coordinates (e.g. \"472,288\") at its centre. During "
-            "deployment, valid drop-zone tiles are highlighted in gold — "
-            "click on a highlighted tile to deploy. To click a tile, use "
-            "the pixel coordinates shown at its centre."
+            "On board screens, the screenshot has a tile grid overlay. Each "
+            "tile shows its pixel coordinates (e.g. \"472,288\") at its "
+            "centre. During deployment, valid drop-zone tiles are highlighted "
+            "in gold — click on a highlighted tile to deploy. To click a "
+            "tile, use the pixel coordinates shown at its centre. Menus and "
+            "dialogs do not have the grid overlay; click their visible "
+            "buttons normally."
         )
     suffix = ("\n\n" + "\n\n".join(notes)) if notes else ""
     return (
@@ -142,7 +182,7 @@ def build_system_prompt(
 class LoopConfig:
     max_steps: int = 20
     max_images: int = 4
-    action_delay: float = 0.15
+    action_delay: float = 0.5
     show_thinking: bool = False
     normalized_coordinates: bool = False
     snap_to_tile: bool = False
@@ -334,7 +374,9 @@ class HarnessLoop:
         self.step_index = 0
         self.final_text: str | None = None
         self._closed = False
+        self.event_callback: Callable[[dict[str, Any]], None] | None = None
         self.grid: IsoGrid | None = None
+        self._grid_calibrated = False
         self._drop_zone_tiles: list[tuple[float, float]] | None = None
 
         if self.config.console:
@@ -350,6 +392,11 @@ class HarnessLoop:
             snap_to_tile=self.config.snap_to_tile,
             grid_overlay=self.config.grid_overlay,
         )
+        if input_backend.name == "stub":
+            system_prompt += (
+                "\n\nInput is in stub/dry-run mode: actions are recorded but "
+                "NOT sent to the game, so the board will not change."
+            )
         if notes is not None:
             rendered_notes = notes.render_for_prompt()
             if rendered_notes:
@@ -365,20 +412,29 @@ class HarnessLoop:
             },
         ]
 
+    def _emit(self, event_type: str, **data: Any) -> None:
+        if self.event_callback is not None:
+            self.event_callback({"type": event_type, **data})
+
     def _capture(self) -> Frame:
         frame = self.backend.capture_window(self.target.id)
         self.target = frame.window
 
-        # Calibrate the grid lazily on the first capture when either
-        # snap-to-tile or grid-overlay is enabled.  During deployment the
-        # tan drop-zone tiles are visible and provide a good calibration.
-        if self.grid is None and (
+        # Calibrate the grid lazily on captures until the board is found.
+        # During deployment the tan drop-zone tiles are visible and provide a
+        # good calibration.  Menus and dialogs do not have a board, so they
+        # keep the fallback grid uncalibrated and get no misleading overlay.
+        if (
             self.config.snap_to_tile or self.config.grid_overlay
-        ):
+        ) and (self.grid is None or not self._grid_calibrated):
             self._calibrate_grid(frame)
 
-        # Apply the grid overlay to the screenshot returned to the model.
-        if self.config.grid_overlay and self.grid is not None:
+        # Apply the grid overlay only when a real board was detected.
+        if (
+            self.config.grid_overlay
+            and self.grid is not None
+            and self._grid_calibrated
+        ):
             highlighted = None
             if self._drop_zone_tiles:
                 highlighted = self._drop_zone_tiles
@@ -394,6 +450,12 @@ class HarnessLoop:
         self.frame = frame
         path = self.recorder.save_frame(frame)
         self.last_frame_path = path
+        self._emit(
+            "frame",
+            path=str(path.relative_to(self.recorder.root)),
+            width=frame.width,
+            height=frame.height,
+        )
         if self.config.console:
             print(
                 f"  frame {self.recorder.frame_index:04d}  "
@@ -408,6 +470,7 @@ class HarnessLoop:
         grid = calibrate_grid(frame.png, frame.width, frame.height)
         if grid is not None:
             self.grid = grid
+            self._grid_calibrated = True
             # Cache drop-zone tiles for the overlay highlight.
             self._drop_zone_tiles = detect_drop_zone_tiles(frame.png)
             if self.config.console:
@@ -418,8 +481,10 @@ class HarnessLoop:
                     f"({len(self._drop_zone_tiles)} drop-zone tiles)"
                 )
         else:
-            # Fall back to the default grid (measured for 1280×720).
+            # Fall back to the default grid (measured for 1280×720), but do
+            # not draw it until a board is actually detected.
             self.grid = default_grid(frame.width, frame.height)
+            self._grid_calibrated = False
             if self.config.console:
                 print(
                     f"  grid default: origin=({self.grid.origin_x:.0f},"
@@ -453,7 +518,9 @@ class HarnessLoop:
 
     def _require_frame(self) -> Frame:
         if self.frame is None or self.last_frame_path is None:
-            raise ValueError("Call view_board before click or inspect.")
+            raise ValueError(
+                "Call view_board before click, hover, or inspect."
+            )
         return self.frame
 
     def _pause(self) -> None:
@@ -496,7 +563,7 @@ class HarnessLoop:
         Returns ``(snapped_x, snapped_y, row, col)`` or ``None`` if the
         point is too far from any tile centre (likely a UI click).
         """
-        if not self.config.snap_to_tile:
+        if not self.config.snap_to_tile or not self._grid_calibrated:
             return None
         grid = self._ensure_grid(frame)
         sx, sy, row, col = grid.snap(x, y)
@@ -504,6 +571,32 @@ class HarnessLoop:
         if dist > self._SNAP_MAX_DIST:
             return None
         return sx, sy, row, col
+
+    def _resolve_point(
+        self, call: ModelToolCall, frame: Frame
+    ) -> tuple[int, int, str]:
+        """Parse, convert, validate, and optionally snap a point argument."""
+        x, y = parse_point_args(
+            call.arguments,
+            normalized=self.config.normalized_coordinates,
+        )
+        if self.config.normalized_coordinates:
+            x, y = normalized_to_pixels(x, y, frame.width, frame.height)
+        else:
+            x, y = int(round(x)), int(round(y))
+        self._validate_point(frame, x, y)
+
+        snap_info = ""
+        snapped = self._snap_point(frame, x, y)
+        if snapped is not None:
+            nx, ny, row, col = snapped
+            if (nx, ny) != (x, y):
+                snap_info = (
+                    f" Snapped to tile ({row}, {col}) "
+                    f"at pixel ({nx}, {ny})."
+                )
+                x, y = nx, ny
+        return x, y, snap_info
 
     def _execute_tool(
         self, call: ModelToolCall
@@ -538,8 +631,10 @@ class HarnessLoop:
                     ToolResult(
                         ok=True,
                         message=(
-                            "Current board screenshot attached "
-                            f"({frame.width}x{frame.height})."
+                            "Current screenshot attached "
+                            f"({frame.width}x{frame.height}). Valid "
+                            f"coordinates are 0..{frame.width - 1} by "
+                            f"0..{frame.height - 1}."
                         ),
                         image_png=frame.png,
                     ),
@@ -548,26 +643,7 @@ class HarnessLoop:
 
             if call.name == "click":
                 frame = self._require_frame()
-                x, y = parse_point_args(
-                    call.arguments,
-                    normalized=self.config.normalized_coordinates,
-                )
-                if self.config.normalized_coordinates:
-                    x, y = normalized_to_pixels(x, y, frame.width, frame.height)
-                else:
-                    x, y = int(round(x)), int(round(y))
-                self._validate_point(frame, x, y)
-                # Snap to the nearest tile centre if enabled.
-                snap_info: str = ""
-                snapped = self._snap_point(frame, x, y)
-                if snapped is not None:
-                    nx, ny, row, col = snapped
-                    if (nx, ny) != (x, y):
-                        snap_info = (
-                            f" Snapped to tile ({row}, {col}) "
-                            f"at pixel ({nx}, {ny})."
-                        )
-                        x, y = nx, ny
+                x, y, snap_info = self._resolve_point(call, frame)
                 sx = frame.window.x + x
                 sy = frame.window.y + y
                 self.input.click(sx, sy)
@@ -581,10 +657,9 @@ class HarnessLoop:
                     ToolResult(
                         ok=True,
                         message=(
-                            f"Clicked screenshot pixel ({x}, {y}) "
-                            f"at screen ({sx}, {sy}).{snap_info} "
-                            f"Marked screenshot "
-                            f"attached ({frame.width}x{frame.height})."
+                            f"Clicked screenshot pixel ({x}, {y})."
+                            f"{snap_info} Marked screenshot attached "
+                            f"({frame.width}x{frame.height})."
                         ),
                         image_png=marked_png,
                         state_changed=True,
@@ -593,48 +668,48 @@ class HarnessLoop:
                     self.last_frame_path,
                 )
 
-            if call.name == "inspect":
+            if call.name == "hover":
                 frame = self._require_frame()
-                x, y, with_details = parse_inspect_args(
-                    call.arguments,
-                    normalized=self.config.normalized_coordinates,
-                )
-                if self.config.normalized_coordinates:
-                    x, y = normalized_to_pixels(x, y, frame.width, frame.height)
-                else:
-                    x, y = int(round(x)), int(round(y))
-                self._validate_point(frame, x, y)
-                # Snap inspect to the nearest tile centre if enabled.
-                snap_info = ""
-                snapped = self._snap_point(frame, x, y)
-                if snapped is not None:
-                    nx, ny, row, col = snapped
-                    if (nx, ny) != (x, y):
-                        snap_info = (
-                            f" Snapped to tile ({row}, {col}) "
-                            f"at pixel ({nx}, {ny})."
-                        )
-                        x, y = nx, ny
+                x, y, snap_info = self._resolve_point(call, frame)
                 sx = frame.window.x + x
                 sy = frame.window.y + y
                 self.input.hover(sx, sy)
-                if with_details:
-                    self.input.key_down("ctrl")
-                try:
-                    self._pause()
-                    frame = self._capture()
-                finally:
-                    if with_details:
-                        self.input.key_up("ctrl")
+                self._pause()
+                frame = self._capture()
                 return (
                     ToolResult(
                         ok=True,
                         message=(
                             f"Hovered screenshot pixel ({x}, {y}) and "
                             f"captured a {frame.width}x{frame.height} "
-                            "screenshot"
-                            + (" with details." if with_details else ".")
-                            + snap_info
+                            f"screenshot.{snap_info}"
+                        ),
+                        image_png=frame.png,
+                        pixel=(x, y),
+                    ),
+                    self.last_frame_path,
+                )
+
+            if call.name == "inspect":
+                frame = self._require_frame()
+                x, y, snap_info = self._resolve_point(call, frame)
+                sx = frame.window.x + x
+                sy = frame.window.y + y
+                self.input.key_down("ctrl")
+                try:
+                    self.input.hover(sx, sy)
+                    self._pause()
+                    frame = self._capture()
+                finally:
+                    self.input.key_up("ctrl")
+                return (
+                    ToolResult(
+                        ok=True,
+                        message=(
+                            f"Hovered screenshot pixel ({x}, {y}) with "
+                            f"Left Ctrl and captured a {frame.width}x"
+                            f"{frame.height} screenshot with details."
+                            f"{snap_info}"
                         ),
                         image_png=frame.png,
                         pixel=(x, y),
@@ -654,7 +729,8 @@ class HarnessLoop:
                         ok=True,
                         message=(
                             "Attack-order preview attached "
-                            f"({frame.width}x{frame.height})."
+                            f"({frame.width}x{frame.height}). Hover individual "
+                            "targets to inspect them before committing."
                         ),
                         image_png=frame.png,
                     ),
@@ -668,8 +744,8 @@ class HarnessLoop:
                     ToolResult(
                         ok=True,
                         message=(
-                            "Repair mode activated. Click the selected mech "
-                            "as the repair target."
+                            "Repair mode activated. Hover the selected mech "
+                            "to preview the repair, then click it."
                         ),
                         state_changed=True,
                     ),
@@ -684,8 +760,8 @@ class HarnessLoop:
                     ToolResult(
                         ok=True,
                         message=(
-                            f"Weapon {number} selected. Inspect first to "
-                            "preview possible results, then click the target."
+                            f"Weapon {number} selected. Hover the target to "
+                            "preview possible results, then click it."
                         ),
                         state_changed=True,
                     ),
@@ -701,7 +777,7 @@ class HarnessLoop:
                         ok=True,
                         message=(
                             f"Selected unit {number} with key "
-                            f"{UNIT_KEYS[number]!r}."
+                            f"{UNIT_KEYS[number]!r}. Hover it to inspect."
                         ),
                         state_changed=True,
                     ),
@@ -801,7 +877,16 @@ class HarnessLoop:
         step = self.step_index
         if self.config.console:
             print(f"\n[turn {step}]")
+        self._emit("status", phase="model_waiting", step=step)
         printer = ThinkingPrinter(enabled=self.config.console)
+
+        def on_thinking(text: str) -> None:
+            printer.write(text)
+            self._emit("thinking", text=text, step=step)
+
+        def on_content(text: str) -> None:
+            self._emit("content", text=text, step=step)
+
         try:
             turn = self.agent.complete(
                 self.messages,
@@ -809,7 +894,8 @@ class HarnessLoop:
                     include_note=self.notes is not None,
                     normalized=self.config.normalized_coordinates,
                 ),
-                on_thinking=printer.write,
+                on_thinking=on_thinking,
+                on_content=on_content,
             )
         finally:
             printer.close()
@@ -832,9 +918,18 @@ class HarnessLoop:
 
         self.messages.append(_assistant_message(turn))
 
+        self._emit(
+            "turn",
+            step=step,
+            usage=turn.usage,
+            content=turn.content,
+            tool_call_count=len(turn.tool_calls),
+        )
+
         if not turn.tool_calls:
             if self.config.console:
                 print("  model returned no tool call; stopping")
+            self._emit("status", phase="model_stopped", step=step)
             self.final_text = turn.content
             return False
 
@@ -856,14 +951,45 @@ class HarnessLoop:
                 self.last_frame_path,
             )
 
+        self._emit(
+            "status", phase="tool", step=step, tool=primary.name
+        )
         source_frame = self.last_frame_path
         result, next_frame = self._execute_tool(primary)
+        if (
+            self.input.name == "stub"
+            and primary.name in INPUT_TOOLS
+            and result.ok
+        ):
+            result = replace(
+                result,
+                state_changed=False,
+                message=(
+                    f"{result.message} "
+                    "(stub input: action was recorded but not sent)"
+                ),
+            )
         self.messages.append(
             result.as_tool_message(primary.id, primary.name)
         )
         self.recorder.log_tool_call(
             step, primary, result, next_frame, source_frame
         )
+        self._emit(
+            "tool_result",
+            step=step,
+            tool=primary.name,
+            ok=result.ok,
+            error=result.error,
+            message=result.message,
+            pixel=list(result.pixel) if result.pixel is not None else None,
+            frame=(
+                str(next_frame.relative_to(self.recorder.root))
+                if next_frame is not None
+                else None
+            ),
+        )
+        self._emit("status", phase="turn_done", step=step)
 
         if self.config.console:
             if result.ok:
@@ -987,8 +1113,8 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Use normalized 0..1000 coordinates for click/inspect instead of "
-            "screenshot pixels (default: pixel coordinates)."
+            "Use normalized 0..1000 coordinates for click/hover/inspect "
+            "instead of screenshot pixels (default: pixel coordinates)."
         ),
     )
     parser.add_argument(
@@ -996,7 +1122,8 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Snap click/inspect coordinates to the nearest board tile centre. "
+            "Snap click/hover/inspect coordinates to the nearest board tile "
+            "centre. "
             "The grid is calibrated from the drop-zone tiles during deployment "
             "and reused for the rest of the game (default: off)."
         ),
@@ -1007,8 +1134,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "Draw the isometric tile grid with pixel-coordinate labels on "
-            "every screenshot. Drop-zone tiles are highlighted in gold during "
-            "deployment. Implies grid calibration (default: off)."
+            "board screenshots after the grid is calibrated. Drop-zone tiles "
+            "are highlighted in gold during deployment. Menus and dialogs "
+            "are left clean (default: off)."
         ),
     )
     parser.add_argument(
@@ -1023,8 +1151,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--action-delay",
         type=float,
-        default=0.15,
-        help="Seconds to wait after clicks, keys, and hovers (default: 0.15).",
+        default=0.5,
+        help="Seconds to wait after clicks, keys, and hovers (default: 0.5).",
     )
     parser.add_argument(
         "--stream",
@@ -1056,6 +1184,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=6000,
         help="Maximum note characters loaded into the prompt (default: 6000).",
+    )
+    parser.add_argument(
+        "--model-timeout",
+        type=float,
+        default=180.0,
+        help="Mistral request timeout in seconds (default: 180).",
     )
     parser.add_argument(
         "--cache-key",
@@ -1116,6 +1250,7 @@ def main(argv: list[str] | None = None) -> int:
                 model=args.model,
                 prompt_cache_key=args.cache_key,
                 stream=args.stream,
+                timeout_ms=max(1, int(args.model_timeout * 1000)),
             )
         except RuntimeError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -1145,6 +1280,14 @@ def main(argv: list[str] | None = None) -> int:
             out_dir=args.out.expanduser(),
             model=agent.model,
         )
+        if input_backend.name == "stub":
+            print(
+                "warning: input backend is 'stub'; clicks and keys are "
+                "recorded but NOT sent to the game. Use --input x11 for real "
+                "input.",
+                file=sys.stderr,
+            )
+
         loop = HarnessLoop(
             backend, target, agent, input_backend, config, notes=notes
         )

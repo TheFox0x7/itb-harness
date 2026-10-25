@@ -3,9 +3,20 @@ const state = {
   run: null,
   frameIndex: 0,
   showMarkers: true,
+  coordMode: "pixels",
+  timelineRunId: null,
+  timelineSignature: "",
+  thumbRunId: null,
+  openThinking: new Set(),
   live: null,
   liveSignature: "",
   liveTimer: null,
+  liveSource: null,
+  liveEnded: false,
+  liveInitialized: false,
+  liveActivityAt: 0,
+  liveActivityAgeMs: 0,
+  liveRefreshTimer: null,
   followLive: true,
   cursor: null,
 };
@@ -88,6 +99,7 @@ function renderRunSelect() {
 function actionClassName(action) {
   if (!action.ok) return "action error";
   if (action.tool === "click") return "action click";
+  if (action.tool === "hover") return "action hover";
   if (action.tool === "inspect") return "action inspect";
   return "action";
 }
@@ -96,17 +108,36 @@ function jumpTarget(action) {
   return action.frame_name || action.source_frame_name || null;
 }
 
-function renderTimeline() {
+function renderTimeline(options = {}) {
   const timeline = $("#timeline");
+  const runId = state.run?.id ?? null;
+  const sameRun = state.timelineRunId === runId;
+  const resetScroll = options.resetScroll ?? !sameRun;
+  const toBottom = options.toBottom ?? false;
+  const previousScrollTop = resetScroll
+    ? 0
+    : (options.scrollTop ?? timeline.scrollTop);
+  const wasAtBottom =
+    !resetScroll &&
+    (options.wasAtBottom ??
+      timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 40);
+
+  if (!sameRun) state.openThinking.clear();
   timeline.replaceChildren();
+
   const turns = state.run?.turns ?? [];
   if (!turns.length) {
     timeline.append(el("div", "muted", "No turns recorded."));
+    state.timelineRunId = runId;
+    timeline.scrollTop = 0;
     return;
   }
 
+  const fragment = document.createDocumentFragment();
   for (const turn of turns) {
+    const key = String(turn.step);
     const box = el("div", "turn");
+    box.dataset.step = key;
     const head = el("div", "turn-head");
     head.append(el("span", null, `Turn ${turn.step}`));
     const usage = usageText(turn.usage);
@@ -115,8 +146,24 @@ function renderTimeline() {
 
     if (turn.thinking) {
       const details = el("details", "thinking");
+      const ensureThinking = () => {
+        if (!details.querySelector("pre")) {
+          details.append(el("pre", null, turn.thinking));
+        }
+      };
       details.append(el("summary", null, "thinking"));
-      details.append(el("pre", null, turn.thinking));
+      details.open = state.openThinking.has(key);
+      if (details.open) ensureThinking();
+      details.addEventListener("toggle", () => {
+        if (details.open) {
+          state.openThinking.add(key);
+          ensureThinking();
+        } else {
+          state.openThinking.delete(key);
+          const pre = details.querySelector("pre");
+          if (pre) pre.remove();
+        }
+      });
       box.append(details);
     }
 
@@ -159,25 +206,53 @@ function renderTimeline() {
       box.append(actions);
     }
 
-    timeline.append(box);
+    fragment.append(box);
+  }
+
+  timeline.append(fragment);
+  state.timelineRunId = runId;
+  if (resetScroll) {
+    timeline.scrollTop = toBottom ? timeline.scrollHeight : 0;
+  } else if (wasAtBottom) {
+    timeline.scrollTop = timeline.scrollHeight;
+  } else {
+    timeline.scrollTop = previousScrollTop;
   }
 }
 
 function renderThumbs() {
   const thumbs = $("#thumbs");
-  thumbs.replaceChildren();
   const frames = state.run?.frames ?? [];
-  frames.forEach((name, index) => {
+  const runId = state.run?.id ?? null;
+  const sameRun = state.thumbRunId === runId;
+
+  if (!sameRun || frames.length < thumbs.children.length) {
+    thumbs.replaceChildren();
+  }
+  state.thumbRunId = runId;
+
+  const fragment = document.createDocumentFragment();
+  for (let index = thumbs.children.length; index < frames.length; index++) {
+    const name = frames[index];
     const button = el("button", "thumb");
     button.title = name;
-    if (index === state.frameIndex) button.classList.add("active");
     const image = el("img");
+    image.loading = "lazy";
+    image.decoding = "async";
     image.src = frameURL(name);
     image.alt = name;
     button.append(image);
     button.addEventListener("click", () => showFrame(index));
-    thumbs.append(button);
-  });
+    fragment.append(button);
+  }
+  if (fragment.childNodes.length) thumbs.append(fragment);
+
+  for (let index = 0; index < thumbs.children.length; index++) {
+    thumbs.children[index].classList.toggle(
+      "active",
+      index === state.frameIndex
+    );
+  }
 }
 
 function positionOverlay() {
@@ -228,7 +303,14 @@ function drawCrosshair(ctx) {
   ctx.stroke();
   ctx.setLineDash([]);
   ctx.restore();
-  drawLabel(ctx, `${x}, ${y}`, x, y, "#ffd166");
+  const display = displayPoint(state.cursor);
+  drawLabel(
+    ctx,
+    display ? `${display.x}, ${display.y}` : `${x}, ${y}`,
+    x,
+    y,
+    "#ffd166"
+  );
 }
 
 function drawMarkers() {
@@ -251,7 +333,12 @@ function drawMarkers() {
 
         const [x, y] = action.point_2d;
         const inspect = action.tool === "inspect";
-        const color = inspect ? "#54c8ff" : "#ff6259";
+        const hover = action.tool === "hover";
+        const color = inspect
+          ? "#54c8ff"
+          : hover
+            ? "#8fd3a8"
+            : "#ff6259";
 
         ctx.strokeStyle = color;
         ctx.fillStyle = color;
@@ -272,7 +359,9 @@ function drawMarkers() {
           ? action.with_details
             ? "inspect +details"
             : "inspect"
-          : "click";
+          : hover
+            ? "hover"
+            : "click";
         drawLabel(ctx, label, x, y, color);
       }
     }
@@ -305,13 +394,35 @@ function imagePoint(event) {
   };
 }
 
+function displayPoint(point) {
+  if (!point) return null;
+  if (state.coordMode !== "normalized") return point;
+  const image = $("#frame-img");
+  const width = image.naturalWidth;
+  const height = image.naturalHeight;
+  if (!width || !height) return point;
+  return {
+    x: Math.round((point.x / Math.max(1, width - 1)) * 1000),
+    y: Math.round((point.y / Math.max(1, height - 1)) * 1000),
+  };
+}
+
+function pointText(point) {
+  const display = displayPoint(point);
+  return display ? `x=${display.x}  y=${display.y}` : "x=— y=—";
+}
+
 function setCoordReadout(text) {
   $("#coords").textContent = text;
 }
 
+function updateCoordReadout() {
+  setCoordReadout(pointText(state.cursor));
+}
+
 function clearCursor() {
   state.cursor = null;
-  setCoordReadout("x=— y=—");
+  updateCoordReadout();
   drawMarkers();
 }
 
@@ -328,10 +439,12 @@ function updateFrameToolbar() {
 function showFrame(index) {
   const frames = state.run?.frames ?? [];
   state.cursor = null;
-  setCoordReadout("x=— y=—");
+  updateCoordReadout();
 
   if (!frames.length) {
-    $("#frame-img").style.display = "none";
+    const image = $("#frame-img");
+    image.dataset.frameName = "";
+    image.style.display = "none";
     $("#overlay").style.display = "none";
     $("#empty").style.display = "block";
     state.frameIndex = 0;
@@ -349,11 +462,21 @@ function showFrame(index) {
   image.style.display = "block";
   canvas.style.display = "block";
 
-  image.onload = () => {
+  const sameImage =
+    image.dataset.frameName === name &&
+    image.complete &&
+    image.naturalWidth > 0;
+  if (sameImage) {
     positionOverlay();
     drawMarkers();
-  };
-  image.src = frameURL(name);
+  } else {
+    image.dataset.frameName = name;
+    image.onload = () => {
+      positionOverlay();
+      drawMarkers();
+    };
+    image.src = frameURL(name);
+  }
 
   updateFrameToolbar();
   renderThumbs();
@@ -365,10 +488,35 @@ function jumpToFrame(name) {
   if (index >= 0) showFrame(index);
 }
 
+function timelineSignature(run) {
+  return (run?.turns ?? [])
+    .map((turn) => {
+      const actions = turn.actions ?? [];
+      const last = actions[actions.length - 1];
+      return [
+        turn.step,
+        (turn.thinking ?? "").length,
+        (turn.content ?? "").length,
+        actions.length,
+        last?.tool ?? "",
+        last?.ok ? 1 : 0,
+        (last?.message ?? "").length,
+      ].join(":");
+    })
+    .join("|");
+}
+
 async function loadRun(runId, options = {}) {
   const { preserveFrame = false } = options;
   const previousFrame = frameName(state.frameIndex);
-  $("#timeline").replaceChildren(el("div", "muted", "Loading…"));
+  const timeline = $("#timeline");
+  const sameRun = state.run?.id === runId;
+  const scrollTop = timeline.scrollTop;
+  const wasAtBottom =
+    timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 40;
+  if (!sameRun) {
+    timeline.replaceChildren(el("div", "muted", "Loading…"));
+  }
   const run = await fetchJSON(`/api/runs/${encodeURIComponent(runId)}`);
   state.run = run;
 
@@ -386,7 +534,16 @@ async function loadRun(runId, options = {}) {
   }
 
   renderMeta();
-  renderTimeline();
+  const signature = timelineSignature(run);
+  if (!sameRun || signature !== state.timelineSignature) {
+    renderTimeline({
+      resetScroll: !sameRun,
+      toBottom: !sameRun,
+      scrollTop,
+      wasAtBottom,
+    });
+    state.timelineSignature = signature;
+  }
   showFrame(state.frameIndex);
 }
 
@@ -403,13 +560,21 @@ function liveSignature(live) {
 
 function updateLiveControls(live) {
   const panel = $("#live-panel");
+  const stream = $("#live-stream");
   if (!live?.active) {
     panel.hidden = true;
+    stream.hidden = true;
     return;
   }
   panel.hidden = false;
+  stream.hidden = false;
   const label = live.busy ? `${live.state} (working)` : live.state;
   $("#live-state").textContent = label;
+  const input = live.input ?? "unknown";
+  const inputNode = $("#live-input");
+  inputNode.textContent = input === "stub" ? "input: stub (not sent)" : `input: ${input}`;
+  inputNode.className = input === "stub" ? "live-input warning" : "live-input";
+  if (live.phase) $("#live-phase").textContent = live.phase;
   $("#live-error").textContent = live.error
     ? `error: ${live.error}`
     : live.reason
@@ -425,13 +590,213 @@ function updateLiveControls(live) {
   );
 }
 
+function updateLiveActivity() {
+  const live = state.live;
+  const label = $("#live-activity");
+  if (!live?.active) {
+    label.textContent = "";
+    return;
+  }
+  const phase = live.phase ?? state.livePhase ?? "idle";
+  if (!["model_waiting", "thinking", "content"].includes(phase)) {
+    label.textContent = "";
+    label.className = "live-activity";
+    return;
+  }
+
+  const ageMs = state.liveActivityAt
+    ? Math.max(0, Date.now() - state.liveActivityAt)
+    : state.liveActivityAgeMs || 0;
+  const seconds = Math.floor(ageMs / 1000);
+  let prefix = "last activity";
+  if (phase === "model_waiting") prefix = "waiting for first token";
+  else if (phase === "thinking") prefix = "thinking";
+  else if (phase === "content") prefix = "streaming content";
+
+  label.textContent = `${prefix} · ${seconds}s ago`;
+  label.className = "live-activity";
+  if (seconds >= 30) label.classList.add("stalled");
+  else if (seconds >= 15) label.classList.add("warning");
+}
+
+function liveResetThinking() {
+  state.liveInitialized = false;
+  $("#live-thinking").textContent = "";
+  $("#live-content").textContent = "";
+}
+
+function liveAppendThinking(text) {
+  if (!text) return;
+  state.liveInitialized = true;
+  const node = $("#live-thinking");
+  node.textContent += text;
+  node.scrollTop = node.scrollHeight;
+}
+
+function liveAppendContent(text) {
+  if (!text) return;
+  state.liveInitialized = true;
+  const node = $("#live-content");
+  node.textContent += text;
+  node.scrollTop = node.scrollHeight;
+}
+
+function requestLiveRunRefresh() {
+  if (state.liveRefreshTimer) return;
+  state.liveRefreshTimer = setTimeout(() => {
+    state.liveRefreshTimer = null;
+    pollLive();
+  }, 120);
+}
+
+function liveIsTerminal(live) {
+  return ["stopped", "stopping", "error"].includes(live?.state);
+}
+
+function handleLiveEvent(event) {
+  state.liveActivityAt = Date.now();
+  state.liveActivityAgeMs = 0;
+  const type = event.type;
+
+  // Stop is asynchronous: the model request may still be finishing. Do not
+  // keep appending its stream after the user has asked to stop.
+  if (
+    ["thinking", "content"].includes(type) &&
+    liveIsTerminal(state.live)
+  ) {
+    return;
+  }
+
+  if (type === "status") {
+    if (event.state) {
+      state.live = { ...(state.live ?? {}), ...event, active: true };
+      updateLiveControls(state.live);
+    }
+    if (event.phase) {
+      state.livePhase = event.phase;
+      $("#live-phase").textContent = event.phase;
+    }
+    if (event.last_activity_age_ms != null) {
+      state.liveActivityAgeMs = event.last_activity_age_ms;
+      state.liveActivityAt = Date.now() - event.last_activity_age_ms;
+    }
+    if (event.phase === "model_waiting") {
+      liveResetThinking();
+    }
+    if (!state.liveInitialized && event.thinking != null) {
+      liveAppendThinking(event.thinking);
+    }
+    if (!state.liveInitialized && event.content != null) {
+      liveAppendContent(event.content);
+    }
+    updateLiveActivity();
+    return;
+  }
+
+  if (type === "thinking") {
+    liveAppendThinking(event.text);
+    state.livePhase = "thinking";
+    $("#live-phase").textContent = "thinking";
+    updateLiveActivity();
+    return;
+  }
+
+  if (type === "content") {
+    liveAppendContent(event.text);
+    state.livePhase = "content";
+    $("#live-phase").textContent = "content";
+    updateLiveActivity();
+    return;
+  }
+
+  if (["frame", "turn", "tool_result"].includes(type)) {
+    requestLiveRunRefresh();
+    return;
+  }
+
+  if (type === "error") {
+    state.live = {
+      ...(state.live ?? {}),
+      active: true,
+      state: "error",
+      error: event.error ?? "model error",
+    };
+    state.liveEnded = true;
+    state.livePhase = "error";
+    $("#live-phase").textContent = "error";
+    updateLiveControls(state.live);
+    if (state.liveSource) {
+      state.liveSource.close();
+      state.liveSource = null;
+    }
+    requestLiveRunRefresh();
+    return;
+  }
+
+  if (type === "stopped") {
+    state.live = {
+      ...(state.live ?? {}),
+      active: true,
+      state: "stopped",
+      reason: event.reason ?? state.live?.reason,
+    };
+    state.liveEnded = true;
+    state.livePhase = "stopped";
+    $("#live-phase").textContent = "stopped";
+    updateLiveControls(state.live);
+    if (state.liveSource) {
+      state.liveSource.close();
+      state.liveSource = null;
+    }
+    requestLiveRunRefresh();
+  }
+}
+
+function startLiveStream() {
+  if (
+    state.liveSource ||
+    state.liveEnded ||
+    !state.live?.active ||
+    liveIsTerminal(state.live)
+  ) {
+    return;
+  }
+  const source = new EventSource("/api/live/events");
+  state.liveSource = source;
+  source.onmessage = (message) => {
+    try {
+      handleLiveEvent(JSON.parse(message.data));
+    } catch (error) {
+      $("#live-error").textContent = `event parse error: ${error}`;
+    }
+  };
+  source.onerror = () => {
+    if (state.live?.active && state.live?.state !== "stopped") {
+      $("#live-error").textContent = "live event stream disconnected; reconnecting…";
+    }
+  };
+}
+
 async function pollLive() {
   try {
     const live = await fetchJSON("/api/live");
     state.live = live;
     updateLiveControls(live);
 
-    if (!live?.active) return;
+    if (!live?.active) {
+      if (state.liveSource) {
+        state.liveSource.close();
+        state.liveSource = null;
+      }
+      return;
+    }
+    if (liveIsTerminal(live)) state.liveEnded = true;
+    state.livePhase = live.phase ?? state.livePhase;
+    if (live.last_activity_age_ms != null) {
+      state.liveActivityAt = Date.now() - live.last_activity_age_ms;
+    }
+    if (!state.liveSource) startLiveStream();
+    updateLiveActivity();
     const signature = liveSignature(live);
     const changed = signature !== state.liveSignature;
     state.liveSignature = signature;
@@ -462,6 +827,11 @@ async function pollLive() {
 
 async function liveCommand(command) {
   try {
+    if (command === "stop" && state.live) {
+      state.live = { ...state.live, state: "stopping" };
+      state.livePhase = "stopping";
+      updateLiveControls(state.live);
+    }
     await fetch(`/api/live/${command}`, { method: "POST" });
     await pollLive();
     setTimeout(pollLive, 250);
@@ -482,12 +852,16 @@ async function init() {
 
     if (live?.active && live.run_id) {
       state.live = live;
+      state.liveEnded = liveIsTerminal(live);
       state.followLive = true;
       $("#follow-live").checked = true;
       state.lastLiveSteps = live.steps;
       state.lastLiveActions = live.actions;
       state.lastLiveFrames = live.frames;
+      state.livePhase = live.phase ?? "idle";
+      state.liveActivityAt = Date.now() - (live.last_activity_age_ms ?? 0);
       await loadRun(live.run_id);
+      startLiveStream();
     } else if (state.runs.length) {
       const select = $("#run-select");
       select.value = state.runs[0].id;
@@ -498,7 +872,8 @@ async function init() {
       );
     }
 
-    state.liveTimer = setInterval(pollLive, 600);
+    state.liveTimer = setInterval(pollLive, 1200);
+    setInterval(updateLiveActivity, 1000);
   } catch (error) {
     $("#timeline").replaceChildren(
       el("div", "action-result error", `Could not load runs: ${error}`)
@@ -536,6 +911,12 @@ $("#live-stop").addEventListener("click", () => liveCommand("stop"));
 $("#prev-frame").addEventListener("click", () => showFrame(state.frameIndex - 1));
 $("#next-frame").addEventListener("click", () => showFrame(state.frameIndex + 1));
 
+$("#coord-normalized").addEventListener("change", (event) => {
+  state.coordMode = event.target.checked ? "normalized" : "pixels";
+  updateCoordReadout();
+  drawMarkers();
+});
+
 $("#show-markers").addEventListener("change", (event) => {
   state.showMarkers = event.target.checked;
   drawMarkers();
@@ -548,7 +929,7 @@ $("#image-stage").addEventListener("mousemove", (event) => {
     return;
   }
   state.cursor = point;
-  setCoordReadout(`x=${point.x}  y=${point.y}`);
+  updateCoordReadout();
   drawMarkers();
 });
 
@@ -559,16 +940,14 @@ $("#image-stage").addEventListener("mouseleave", () => {
 $("#image-stage").addEventListener("click", async (event) => {
   const point = imagePoint(event);
   if (!point) return;
+  const display = displayPoint(point);
+  const text = `${display.x}, ${display.y}`;
   try {
-    await navigator.clipboard.writeText(`${point.x}, ${point.y}`);
-    setCoordReadout(`copied ${point.x}, ${point.y}`);
-    setTimeout(() => {
-      if (state.cursor) {
-        setCoordReadout(`x=${state.cursor.x}  y=${state.cursor.y}`);
-      }
-    }, 900);
+    await navigator.clipboard.writeText(text);
+    setCoordReadout(`copied ${text}`);
+    setTimeout(updateCoordReadout, 900);
   } catch (error) {
-    setCoordReadout(`x=${point.x}  y=${point.y}`);
+    updateCoordReadout();
   }
 });
 

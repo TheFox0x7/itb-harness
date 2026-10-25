@@ -7,14 +7,16 @@ serves a small browser UI.  It does not control a live run.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import queue
 import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 
@@ -75,7 +77,7 @@ def _action_from_record(record: dict[str, Any]) -> dict[str, Any]:
     if action.get("ok", True) and action["point_2d"] is not None:
         if action.get("tool") == "click" and action["source_frame_name"]:
             marker_frames.append(action["source_frame_name"])
-        elif action.get("tool") == "inspect":
+        elif action.get("tool") in {"hover", "inspect"}:
             for name in (
                 action["source_frame_name"],
                 action["frame_name"],
@@ -85,9 +87,11 @@ def _action_from_record(record: dict[str, Any]) -> dict[str, Any]:
     action["marker_frames"] = marker_frames
 
     args = action.get("arguments")
-    action["with_details"] = bool(
-        isinstance(args, dict) and args.get("with_details")
-    )
+    if isinstance(args, dict) and "with_details" in args:
+        # Preserve the old inspect flag for runs recorded before the split.
+        action["with_details"] = bool(args.get("with_details"))
+    else:
+        action["with_details"] = action.get("tool") == "inspect"
     return action
 
 
@@ -227,6 +231,54 @@ def create_app(runs_dir: Path, live: Any | None = None) -> FastAPI:
         session = _require_live()
         session.stop()
         return session.snapshot()
+
+    @app.get("/api/live/events")
+    async def api_live_events(
+        after: int = 0,
+        last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    ) -> StreamingResponse:
+        session = _require_live()
+        if last_event_id:
+            try:
+                after = max(after, int(last_event_id))
+            except ValueError:
+                pass
+
+        subscriber = session.subscribe(after)
+
+        async def generate():
+            try:
+                while True:
+                    try:
+                        event = await asyncio.to_thread(
+                            subscriber.get, True, 1.0
+                        )
+                    except queue.Empty:
+                        snapshot = session.snapshot()
+                        yield (
+                            f"data: {json.dumps({'type': 'status', **snapshot})}"
+                            "\n\n"
+                        )
+                        continue
+
+                    yield (
+                        f"id: {event.get('seq', 0)}\n"
+                        f"data: {json.dumps(event)}\n\n"
+                    )
+                    if event.get("type") in {"stopped", "error"}:
+                        break
+            finally:
+                session.unsubscribe(subscriber)
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.get("/")
     def index() -> FileResponse:

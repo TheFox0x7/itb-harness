@@ -88,6 +88,34 @@ class ReplayLoaderTests(unittest.TestCase):
             )
             self.assertTrue(inspect["with_details"])
 
+    def test_hover_action_has_markers_without_details(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = self.make_run(root)
+            actions_path = run / "actions.jsonl"
+            actions = [
+                json.loads(line)
+                for line in actions_path.read_text().splitlines()
+            ]
+            actions.append(
+                {
+                    "step": 4,
+                    "tool": "hover",
+                    "arguments": {"point_2d": [100, 120]},
+                    "ok": True,
+                    "frame": "frames/0002.png",
+                    "source_frame": "frames/0002.png",
+                }
+            )
+            actions_path.write_text(
+                "\n".join(json.dumps(action) for action in actions) + "\n"
+            )
+
+            loaded = load_run(run)
+            hover = loaded["turns"][3]["actions"][0]
+            self.assertEqual(hover["marker_frames"], ["0002.png"])
+            self.assertFalse(hover["with_details"])
+
     def test_list_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

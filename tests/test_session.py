@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import queue
 import tempfile
 import time
 import unittest
@@ -127,6 +128,43 @@ class SessionRunnerTests(unittest.TestCase):
             self.assertEqual(snapshot["steps"], 4)
             self.assertEqual(snapshot["frames"], 3)
             self.assertEqual(snapshot["reason"], "model_stopped")
+
+    def test_events_and_snapshot_are_exposed(self) -> None:
+        turns = [
+            ModelTurn(
+                content="done",
+                thinking="considering the board",
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = HarnessLoop(
+                FakeBackend(),
+                WINDOW,
+                ScriptedAgent(turns),
+                StubInput(),
+                LoopConfig(action_delay=0, out_dir=Path(tmp)),
+            )
+            runner = SessionRunner(loop)
+            events = runner.subscribe(0)
+            runner.start()
+            self.assertTrue(runner.step())
+            wait_for(lambda: runner.snapshot()["state"] == "stopped")
+
+            received = []
+            while True:
+                try:
+                    received.append(events.get_nowait())
+                except queue.Empty:
+                    break
+            types = [event["type"] for event in received]
+            self.assertIn("thinking", types)
+            self.assertIn("status", types)
+            self.assertIn("stopped", types)
+
+            snapshot = runner.snapshot()
+            self.assertEqual(snapshot["phase"], "stopped")
+            self.assertEqual(snapshot["thinking"], "considering the board")
+            self.assertIsNotNone(snapshot["last_activity_age_ms"])
 
     def test_stop_while_paused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

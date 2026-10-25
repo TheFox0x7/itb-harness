@@ -213,6 +213,9 @@ class LoopTests(unittest.TestCase):
             self.assertEqual(records[0]["frame"], "frames/0001.png")
             self.assertEqual(records[1]["frame"], "frames/0002.png")
             self.assertEqual(records[1]["source_frame"], "frames/0001.png")
+            self.assertFalse(records[1]["state_changed"])
+            self.assertIn("not sent", records[1]["message"])
+            self.assertNotIn("at screen", records[1]["message"])
             self.assertEqual(records[2]["frame"], "frames/0003.png")
 
     def test_click_before_view_is_rejected(self) -> None:
@@ -234,11 +237,32 @@ class LoopTests(unittest.TestCase):
             self.assertEqual(records[0]["error"], "no_frame")
             self.assertIn("view_board", records[0]["message"])
 
-    def test_inspect_hovers_and_captures(self) -> None:
+    def test_inspect_hovers_with_details_and_captures(self) -> None:
         turns = [
             ModelTurn(tool_calls=(call("view_board"),)),
             ModelTurn(
                 tool_calls=(call("inspect", {"point_2d": [480, 809]}),)
+            ),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(turns, Path(tmp))
+            self.assertEqual(result.actions, 0)
+            self.assertEqual(result.frames, 2)
+            self.assertEqual(
+                pointer.events,
+                [
+                    InputEvent("key_down", key="ctrl"),
+                    InputEvent("hover", 480, 809),
+                    InputEvent("key_up", key="ctrl"),
+                ],
+            )
+
+    def test_hover_only_hovers(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(
+                tool_calls=(call("hover", {"point_2d": [480, 809]}),)
             ),
             ModelTurn(content="done"),
         ]
@@ -259,10 +283,7 @@ class LoopTests(unittest.TestCase):
             ModelTurn(tool_calls=(call("repair"),)),
             ModelTurn(
                 tool_calls=(
-                    call(
-                        "inspect",
-                        {"point_2d": [960, 540], "with_details": True},
-                    ),
+                    call("inspect", {"point_2d": [960, 540]}),
                 )
             ),
             ModelTurn(tool_calls=(call("attack_order"),)),
@@ -283,8 +304,8 @@ class LoopTests(unittest.TestCase):
                     InputEvent("key", key="a"),
                     InputEvent("key", key="2"),
                     InputEvent("key", key="r"),
-                    InputEvent("hover", 960, 540),
                     InputEvent("key_down", key="ctrl"),
+                    InputEvent("hover", 960, 540),
                     InputEvent("key_up", key="ctrl"),
                     InputEvent("key_down", key="alt"),
                     InputEvent("key_up", key="alt"),
@@ -509,8 +530,15 @@ class LoopTests(unittest.TestCase):
         client = StreamingClient()
         agent = MistralAgent(model="test", client=client, stream=True)
         chunks: list[str] = []
-        turn = agent.complete([], None, on_thinking=chunks.append)
+        contents: list[str] = []
+        turn = agent.complete(
+            [],
+            None,
+            on_thinking=chunks.append,
+            on_content=contents.append,
+        )
         self.assertEqual(chunks, ["look ", "left"])
+        self.assertEqual(contents, ["[]"])
         self.assertEqual(turn.thinking, "look left")
         self.assertEqual(turn.content, "[]")
         self.assertEqual(turn.usage["cached_tokens"], 0)
@@ -676,6 +704,25 @@ class LoopTests(unittest.TestCase):
             # Drop zone tiles should be cached for highlighting.
             self.assertIsNotNone(loop._drop_zone_tiles)
             self.assertGreater(len(loop._drop_zone_tiles), 0)
+
+    def test_grid_overlay_skips_uncalibrated_screens(self) -> None:
+        """Menus without detectable board tiles should not get an overlay."""
+        raw_png = tiny_png()
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(
+                turns,
+                Path(tmp),
+                grid_overlay=True,
+                png=raw_png,
+                window=WINDOW_1280,
+            )
+            saved = (result.run_dir / "frames" / "0001.png").read_bytes()
+            self.assertEqual(saved, raw_png)
+            self.assertFalse(loop._grid_calibrated)
 
     def test_grid_overlay_disabled_by_default(self) -> None:
         """Without grid_overlay, screenshots are not annotated."""

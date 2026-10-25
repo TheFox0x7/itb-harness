@@ -98,9 +98,10 @@ The viewer reads `run.json`, `conversation.jsonl`, `actions.jsonl`, and
 - per-turn thinking, model text, usage, and tool calls
 - frame thumbnails and previous/next navigation
 - the latest screenshot by default
-- click/hover markers drawn from `click`/`inspect` points
-- live pixel-coordinate readout and crosshair while hovering the image
-- click the image to copy the current `x, y` to the clipboard
+- click/hover markers drawn from `click`/`hover`/`inspect` points
+- live coordinate readout and crosshair while hovering the image
+- optional normalized `0–1000` coordinate readout/copy mode
+- click the image to copy the current coordinates to the clipboard
 - marker toggle and keyboard left/right frame navigation
 
 It is read-only and binds to `127.0.0.1` by default. It does not control a live
@@ -128,14 +129,34 @@ Controls:
 - **Step** — execute one model turn/tool call, then pause again
 - **Resume** — run continuously until paused or stopped
 - **Pause** — finish the current step, then pause
-- **Stop** — stop after the current step
+- **Stop** — stop after the current step (an in-flight model request may finish)
 - **follow** — keep the browser on the live run and latest frame
 
-There is no predetermined step count in web mode; `--steps` is ignored. The
-live UI reloads tool calls, frames, and timeline data roughly every 600 ms.
-Harness console output is suppressed in web mode; thinking appears in the
-browser after each turn completes. Token-level thinking is still only streamed
-in the terminal when running headless.
+There is no predetermined step count in web mode; `--steps` is ignored.
+
+The live UI uses an SSE stream at `/api/live/events` for:
+
+- `thinking` and `content` deltas
+- phase/status changes
+- tool results and frame notifications
+- first-token latency and last-activity age
+
+The thinking panel streams live, and the status line shows phases such as
+`model_waiting`, `thinking`, `content`, `tool`, and `paused`. A warning appears
+after 15 seconds without model activity and a stalled style after 30 seconds.
+After **Stop**, the UI closes the SSE stream and ignores late thinking/content
+events instead of replaying them. Run files are still polled as a fallback for
+timeline/frame refresh.
+
+The timeline opens at the latest turn and preserves its scroll position and
+expanded thinking blocks across live refreshes. If you are at the bottom, it
+follows new turns; otherwise it stays where you were reading. Thinking text is
+loaded into the DOM only when its block is expanded, so long runs stay light.
+
+Harness console output is suppressed in web mode. Token-level thinking is
+streamed only in the browser in web mode, and in the terminal in headless mode.
+`--model-timeout` sets the Mistral request timeout (default 180 seconds); use
+**Stop** if a request appears stuck for longer than that.
 
 The live server also serves the replay UI for all runs under `--out` (default
 `runs/`). `itb-web` remains a read-only replay server for recorded runs.
@@ -151,33 +172,41 @@ plus an optional persistent-note tool:
 | Tool | Args | Effect |
 |---|---|---|
 | `view_board` | — | Capture and return the current game screenshot |
-| `click` | `point_2d` pixels or normalized | Move, left-click, and return a screenshot marked at the click |
-| `inspect` | `point_2d`, optional `with_details` | Hover and capture; `with_details` holds Left Ctrl while capturing |
-| `attack_order` | — | Hold Left Alt and capture the attack-order preview |
-| `repair` | — | Press `R`; then click the selected mech as the repair target |
-| `weapon` | `number` 1 or 2 | Press that number; then click the target |
-| `select_unit` | `number` 1-5 | Press A/S/D/Z/X for units 1-5 |
+| `click` | `point_2d` pixels or normalized | Move, left-click, and return a screenshot marked at the click; hover first to preview |
+| `hover` | `point_2d` pixels or normalized | Hover and capture a plain screenshot without details |
+| `inspect` | `point_2d` pixels or normalized | Hover while holding Left Ctrl and capture detailed tooltips |
+| `attack_order` | — | Hold Left Alt and capture the attack-order preview; hover individual targets before committing |
+| `repair` | — | Press `R`; hover the selected mech to preview, then click it as the repair target |
+| `weapon` | `number` 1 or 2 | Press that number; hover the target to preview, then click it |
+| `select_unit` | `number` 1-5 | Press A/S/D/Z/X for units 1-5; hover the selected unit to inspect it |
 | `end_turn` | — | Press Space |
 | `undo_move` | — | Press Left Shift; only moves can be undone, attacks are permanent |
 | `reset_turn` | — | Press Backspace; once per mission and not always available |
 | `cancel` | — | Right-click |
 | `note` | `text` | Append a note for future runs (only with `--notes`) |
 
+Before the mission, the model may need to navigate the squad selection screen:
+click the center of the top-right **Start** button, wait for the Difficulty
+Setup dialog, choose a difficulty, then click the dialog's bottom-right
+**Start** button. These are UI buttons, not board tiles; the grid overlay is
+not drawn on those screens.
+
 Coordinates default to `[x, y]` in screenshot pixels, origin top-left; the
 valid range is `0..width-1` by `0..height-1`. `view_board` reports the
-screenshot dimensions. Pass `--normalize-coordinates` to switch click/inspect
-points to normalized `0..1000` values instead; use `--no-normalize-coordinates`
-to return to pixels. `repair`, `weapon`, and `select_unit` operate on the
-current UI selection; select mechs and weapons with clicks or the unit keys.
+screenshot dimensions. Pass `--normalize-coordinates` to switch
+click/hover/inspect points to normalized `0..1000` values instead; use
+`--no-normalize-coordinates` to return to pixels. `repair`, `weapon`, and
+`select_unit` operate on the current UI selection; select mechs and weapons
+with clicks or the unit keys.
 
-`click`, `inspect`, and `attack_order` return screenshots. `click` annotates
-the returned frame at the clicked pixel. `repair`, `weapon`, `select_unit`,
+`click`, `hover`, `inspect`, and `attack_order` return screenshots. `click`
+annotates the returned frame at the clicked pixel. `repair`, `weapon`, `select_unit`,
 `end_turn`, `undo_move`, `reset_turn`, and `cancel` return text only; call
 `view_board` when you need to see the result.
 
 The model is instructed to call `view_board` first and to call it again after
-an action when it needs to see the result. `inspect` is for tooltips/hover
-states and returns the screenshot captured after hovering.
+an action when it needs to see the result. `hover` is for plain previews;
+`inspect` holds Left Ctrl for detailed tooltips and predicted attack results.
 
 ```bash
 export MISTRAL_API_KEY=...
@@ -188,24 +217,30 @@ DISPLAY=:2 XAUTHORITY=/run/user/1000/xauth_... \
 ```
 
 `--input stub` (the default) records clicks/hovers without touching the pointer.
+If clicks appear to do nothing, check for the startup warning or the `input`
+field in `run.json`; a `stub` run is a dry run, not a real game session.
 `--input x11` performs real XTest input on `DISPLAY`; use it with the gamescope
-nested display. `--action-delay` waits after clicks, keys, and hover actions;
-`--max-images` controls how many tool screenshots stay in history (`0` keeps
-everything). `--normalize-coordinates` selects normalized 0..1000 points for
-click/inspect; the default is screenshot pixels.
+nested display. `--action-delay` waits after clicks, keys, and hover actions
+(default `0.5`); increase it to `0.6` or more if menu/dialog transitions are
+not finished before the next screenshot. `--max-images` controls how many tool
+screenshots stay in history (`0` keeps everything).
+`--normalize-coordinates` selects normalized 0..1000 points for
+click/hover/inspect; the default is screenshot pixels.
 
-`--snap-to-tile` snaps click/inspect coordinates to the nearest board tile
+`--snap-to-tile` snaps click/hover/inspect coordinates to the nearest board tile
 centre. The isometric grid is calibrated at runtime from the tan drop-zone
 tiles during deployment (colour masking + connected components), then reused
 for the rest of the game. Clicks farther than 60 px from any tile centre are
 left unchanged (assumed to target UI elements). The snap is logged in the
 action record and mentioned in the tool result message.
 
-`--grid-overlay` draws the isometric tile grid on every screenshot: diamond
+`--grid-overlay` draws the isometric tile grid on board screenshots: diamond
 outlines for all 64 tiles, centre markers, and pixel-coordinate labels
 (e.g. `472,288`) at each tile centre. During deployment, valid drop-zone
 tiles are highlighted with a gold tint. The overlay makes it easy for the
-model to read off exact click coordinates instead of estimating them.
+model to read off exact click coordinates instead of estimating them. It is
+only applied after the grid has been calibrated from the board, so start
+menus, squad selection, and dialogs stay clean.
 Implies grid calibration.
 
 Combine both flags for the best results:
@@ -246,7 +281,7 @@ Output:
 ```text
 runs/<timestamp>-agent/
   run.json              backend, input, model, cache key, limits
-  frames/0001.png       screenshots returned by view_board/inspect
+  frames/0001.png       screenshots returned by view_board/hover/inspect
   thinking/0001.txt     model reasoning/thinking chunks, if provided
   actions.jsonl         tool name, args, result, frame links
   conversation.jsonl    model content, thinking, usage, tool calls

@@ -17,6 +17,7 @@
     <span class="live-dot"></span>
     <strong>Live</strong>
     <span id="live-state" class="live-state">paused</span>
+    <span id="live-input" class="live-input"></span>
     <button id="live-step" class="primary">Step</button>
     <button id="live-resume">Resume</button>
     <button id="live-pause">Pause</button>
@@ -34,7 +35,11 @@
         <button id="prev-frame" title="Previous frame">‹</button>
         <span id="frame-label">No frame</span>
         <button id="next-frame" title="Next frame">›</button>
-        <span id="coords" class="coords" title="Image pixel coordinates; click image to copy">x=— y=—</span>
+        <span id="coords" class="coords" title="Coordinates; click image to copy">x=— y=—</span>
+        <label class="toggle coord-mode" title="Show normalized 0–1000 coordinates">
+          <input id="coord-normalized" type="checkbox">
+          0–1000
+        </label>
         <label class="toggle">
           <input id="show-markers" type="checkbox" checked>
           markers
@@ -54,6 +59,15 @@
       <div class="timeline-head">
         <h2>Timeline</h2>
         <span id="turn-count" class="muted"></span>
+      </div>
+      <div id="live-stream" class="live-stream" hidden>
+        <div class="live-stream-head">
+          <span class="live-stream-title">live model</span>
+          <span id="live-phase" class="muted">idle</span>
+          <span id="live-activity" class="live-activity"></span>
+        </div>
+        <pre id="live-thinking"></pre>
+        <pre id="live-content"></pre>
       </div>
       <div id="timeline" class="timeline"></div>
     </aside>

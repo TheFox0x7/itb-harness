@@ -34,6 +34,7 @@ class ChatAgent(Protocol):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         on_thinking: Callable[[str], None] | None = None,
+        on_content: Callable[[str], None] | None = None,
     ) -> ModelTurn:
         """Return the next assistant turn."""
 
@@ -48,6 +49,7 @@ class MistralAgent:
         client: Any | None = None,
         prompt_cache_key: str | None = None,
         stream: bool = False,
+        timeout_ms: int | None = 180_000,
         # temperature: float = 0.0,
     ) -> None:
         self.model = model or os.environ.get(
@@ -59,6 +61,7 @@ class MistralAgent:
             or f"itb-{uuid.uuid4().hex}"
         )
         self.stream = stream
+        self.timeout_ms = timeout_ms
         # self.temperature = temperature
         if client is None:
             key = api_key or os.environ.get("MISTRAL_API_KEY")
@@ -75,6 +78,7 @@ class MistralAgent:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         on_thinking: Callable[[str], None] | None = None,
+        on_content: Callable[[str], None] | None = None,
     ) -> ModelTurn:
         request: dict[str, Any] = {
             "model": self.model,
@@ -87,9 +91,13 @@ class MistralAgent:
             request["tools"] = tools
             request["tool_choice"] = "required"
             request["parallel_tool_calls"] = False
+        if self.timeout_ms is not None:
+            request["timeout_ms"] = self.timeout_ms
 
         if self.stream and hasattr(self.client.chat, "stream"):
-            return self._complete_streaming(request, on_thinking)
+            return self._complete_streaming(
+                request, on_thinking, on_content
+            )
 
         response = self.client.chat.complete(**request)
         choice = response.choices[0]
@@ -125,6 +133,7 @@ class MistralAgent:
         self,
         request: dict[str, Any],
         on_thinking: Callable[[str], None] | None,
+        on_content: Callable[[str], None] | None,
     ) -> ModelTurn:
         text_parts: list[str] = []
         thinking_parts: list[str] = []
@@ -143,7 +152,11 @@ class MistralAgent:
                     continue
                 content = getattr(delta, "content", None)
                 _consume_stream_content(
-                    content, text_parts, thinking_parts, on_thinking
+                    content,
+                    text_parts,
+                    thinking_parts,
+                    on_thinking,
+                    on_content,
                 )
                 _consume_stream_tool_calls(
                     getattr(delta, "tool_calls", None), tool_calls
@@ -170,12 +183,17 @@ class ScriptedAgent:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         on_thinking: Callable[[str], None] | None = None,
+        on_content: Callable[[str], None] | None = None,
     ) -> ModelTurn:
         self.calls.append(messages)
         if self.index >= len(self._turns):
             return ModelTurn(content="done")
         turn = self._turns[self.index]
         self.index += 1
+        if on_thinking is not None and turn.thinking:
+            on_thinking(turn.thinking)
+        if on_content is not None and turn.content:
+            on_content(turn.content)
         return turn
 
 
@@ -267,11 +285,14 @@ def _consume_stream_content(
     text_parts: list[str],
     thinking_parts: list[str],
     on_thinking: Callable[[str], None] | None,
+    on_content: Callable[[str], None] | None,
 ) -> None:
     if content is None:
         return
     if isinstance(content, str):
         text_parts.append(content)
+        if on_content is not None:
+            on_content(content)
         return
     if not isinstance(content, list):
         return
@@ -291,6 +312,8 @@ def _consume_stream_content(
         text = _chunk_text(chunk)
         if text:
             text_parts.append(text)
+            if on_content is not None:
+                on_content(text)
 
 
 def _split_content(content: Any) -> tuple[str | None, str | None]:
@@ -319,6 +342,8 @@ def _split_content(content: Any) -> tuple[str | None, str | None]:
         text = _chunk_text(chunk)
         if text:
             text_parts.append(text)
+            if on_content is not None:
+                on_content(text)
 
     return "\n".join(text_parts) or None, "\n".join(thinking_parts) or None
 

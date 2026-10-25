@@ -27,6 +27,16 @@ class CoordinateModeTests(unittest.TestCase):
         self.assertIn("screenshot pixels", build_system_prompt(False))
         self.assertIn("normalized from 0 to 1000", build_system_prompt(True))
 
+    def test_hover_and_inspect_schemas(self) -> None:
+        tools = {
+            tool["function"]["name"]: tool for tool in tool_schemas()
+        }
+        self.assertIn("hover", tools)
+        self.assertNotIn(
+            "with_details",
+            tools["inspect"]["function"]["parameters"]["properties"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

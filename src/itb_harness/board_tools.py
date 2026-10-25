@@ -1,7 +1,7 @@
 """Board, UI, and observation tools exposed to the model.
 
 Coordinates are screenshot pixels, origin top-left.  The model no longer gets
-an automatic screenshot; it must call view_board/inspect/attack_order.
+an automatic screenshot; it must call view_board/hover/inspect/attack_order.
 """
 
 from __future__ import annotations
@@ -19,10 +19,6 @@ class PointArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     point_2d: list[float] = Field(min_length=2, max_length=2)
-
-
-class InspectArgs(PointArgs):
-    with_details: bool = False
 
 
 class WeaponArgs(BaseModel):
@@ -75,21 +71,6 @@ def _point_schema(normalized: bool) -> dict[str, Any]:
     }
 
 
-def _inspect_schema(normalized: bool) -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "point_2d": _point_property(normalized),
-            "with_details": {
-                "type": "boolean",
-                "default": False,
-                "description": "Hold Left Ctrl while capturing to show details.",
-            },
-        },
-        "required": ["point_2d"],
-        "additionalProperties": False,
-    }
-
 _EMPTY_SCHEMA = {
     "type": "object",
     "properties": {},
@@ -128,40 +109,54 @@ def tool_schemas(
                 "left-click."
             )
             + " Returns a screenshot with the click position marked, so you "
-            "can see the immediate result.",
+            "can see the immediate result. Use hover first to preview the "
+            "tile or target.",
+            _point_schema(normalized),
+        ),
+        _tool(
+            "hover",
+            (
+                "Move the pointer to a normalized 0..1000 coordinate and "
+                "capture a screenshot without holding Ctrl."
+                if normalized
+                else "Move the pointer to a screenshot pixel coordinate and "
+                "capture a screenshot without holding Ctrl."
+            )
+            + " Use this to preview a tile, unit, or target before acting.",
             _point_schema(normalized),
         ),
         _tool(
             "inspect",
             (
-                "Hover at a normalized 0..1000 coordinate and capture a "
-                "screenshot."
+                "Hover at a normalized 0..1000 coordinate while holding Left "
+                "Ctrl and capture a screenshot with detailed tooltips."
                 if normalized
-                else "Hover at a screenshot pixel coordinate and capture a "
-                "screenshot."
+                else "Hover at a screenshot pixel coordinate while holding "
+                "Left Ctrl and capture a screenshot with detailed tooltips."
             )
-            + " Set with_details=true to hold Left Ctrl while capturing "
-            "detailed tooltips. Useful for checking attack results before "
-            "committing.",
-            _inspect_schema(normalized),
+            + " Use this to inspect units, terrain, and predicted attack "
+            "results.",
+            _point_schema(normalized),
         ),
         _tool(
             "attack_order",
             "Hold Left Alt and capture a screenshot showing the attack-order "
-            "preview. Does not click or commit anything.",
+            "preview. Does not click or commit anything. Hover individual "
+            "targets to inspect them before committing.",
             _EMPTY_SCHEMA,
         ),
         _tool(
             "repair",
             "Press R to activate repair mode. Requires a selected mech and an "
-            "available repair; afterwards click the selected mech as the "
-            "target.",
+            "available repair; hover the selected mech to preview the repair, "
+            "then click it as the target.",
             _EMPTY_SCHEMA,
         ),
         _tool(
             "weapon",
             "Press 1 or 2 to select that weapon. Afterwards click the target "
-            "to fire. Inspect first to preview possible attack results.",
+            "to fire. Hover the target first to preview possible attack "
+            "results.",
             {
                 "type": "object",
                 "properties": {
@@ -177,7 +172,8 @@ def tool_schemas(
         ),
         _tool(
             "select_unit",
-            "Select unit 1-5. Keys: 1=A, 2=S, 3=D, 4=Z, 5=X.",
+            "Select unit 1-5. Keys: 1=A, 2=S, 3=D, 4=Z, 5=X. Hover the "
+            "selected unit to inspect it.",
             {
                 "type": "object",
                 "properties": {
@@ -287,17 +283,6 @@ def parse_point_args(
     except ValidationError as exc:
         raise ValueError(_format_validation(exc)) from exc
     return _point_values(parsed, normalized)
-
-
-def parse_inspect_args(
-    arguments: Any, normalized: bool = False
-) -> tuple[float, float, bool]:
-    try:
-        parsed = InspectArgs.model_validate(_load_object(arguments))
-    except ValidationError as exc:
-        raise ValueError(_format_validation(exc)) from exc
-    x, y = _point_values(parsed, normalized)
-    return x, y, bool(parsed.with_details)
 
 
 def parse_weapon_args(arguments: Any) -> int:
