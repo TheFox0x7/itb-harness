@@ -194,6 +194,27 @@ nested display. `--action-delay` waits after clicks, keys, and hover actions;
 everything). `--normalize-coordinates` selects normalized 0..1000 points for
 click/inspect; the default is screenshot pixels.
 
+`--snap-to-tile` snaps click/inspect coordinates to the nearest board tile
+centre. The isometric grid is calibrated at runtime from the tan drop-zone
+tiles during deployment (colour masking + connected components), then reused
+for the rest of the game. Clicks farther than 60 px from any tile centre are
+left unchanged (assumed to target UI elements). The snap is logged in the
+action record and mentioned in the tool result message.
+
+`--grid-overlay` draws the isometric tile grid on every screenshot: diamond
+outlines for all 64 tiles, centre markers, and pixel-coordinate labels
+(e.g. `472,288`) at each tile centre. During deployment, valid drop-zone
+tiles are highlighted with a gold tint. The overlay makes it easy for the
+model to read off exact click coordinates instead of estimating them.
+Implies grid calibration.
+
+Combine both flags for the best results:
+
+```bash
+uv run itb-agent --backend x11 --window Breach --input x11 \
+  --snap-to-tile --grid-overlay --steps 30
+```
+
 Action logs always include the resolved `pixel` coordinate, so replay/live
 markers work in either coordinate mode even when the model’s arguments are
 normalized.

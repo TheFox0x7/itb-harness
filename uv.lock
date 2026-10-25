@@ -132,6 +132,7 @@ source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "mistralai" },
+    { name = "numpy" },
     { name = "pillow" },
     { name = "pydantic" },
     { name = "uvicorn" },
@@ -150,6 +151,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "kwcapture", marker = "extra == 'kde'", specifier = ">=0.7.0" },
     { name = "mistralai", specifier = ">=3.3.0" },
+    { name = "numpy", specifier = ">=2.0" },
     { name = "pillow", specifier = ">=11.0" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "python-xlib", marker = "extra == 'x11'", specifier = ">=0.33" },

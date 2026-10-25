@@ -24,7 +24,8 @@ from pathlib import Path
 from typing import Any
 
 from .agent import ChatAgent, MistralAgent, ModelToolCall, ModelTurn
-from .annotate import annotate_click
+from .annotate import annotate_click, annotate_grid
+from .grid import IsoGrid, calibrate_grid, default_grid, detect_drop_zone_tiles
 from .board_tools import (
     parse_inspect_args,
     parse_note_args,
@@ -96,7 +97,11 @@ You lose the game it it reaches 0 bars. Grid defense is a chance to mitigate the
 """
 
 
-def build_system_prompt(normalized: bool) -> str:
+def build_system_prompt(
+    normalized: bool,
+    snap_to_tile: bool = False,
+    grid_overlay: bool = False,
+) -> str:
     point = (
         "normalized coordinate in the range 0..1000"
         if normalized
@@ -110,8 +115,26 @@ def build_system_prompt(normalized: bool) -> str:
         "the top-left and the bottom-right at (width - 1, height - 1). Use "
         "the dimensions reported by view_board."
     )
-    return SYSTEM_PROMPT.replace("__POINT__", point).replace(
-        "__COORDS__", coords
+    notes: list[str] = []
+    if snap_to_tile:
+        notes.append(
+            "Clicks are automatically snapped to the nearest board tile "
+            "centre, so you do not need to be pixel-perfect when aiming at "
+            "a tile. Aim for the general area of the tile you want."
+        )
+    if grid_overlay:
+        notes.append(
+            "Every screenshot has a tile grid overlay. Each tile shows its "
+            "pixel coordinates (e.g. \"472,288\") at its centre. During "
+            "deployment, valid drop-zone tiles are highlighted in gold — "
+            "click on a highlighted tile to deploy. To click a tile, use "
+            "the pixel coordinates shown at its centre."
+        )
+    suffix = ("\n\n" + "\n\n".join(notes)) if notes else ""
+    return (
+        SYSTEM_PROMPT.replace("__POINT__", point)
+        .replace("__COORDS__", coords)
+        + suffix
     )
 
 
@@ -122,6 +145,8 @@ class LoopConfig:
     action_delay: float = 0.15
     show_thinking: bool = False
     normalized_coordinates: bool = False
+    snap_to_tile: bool = False
+    grid_overlay: bool = False
     console: bool = True
     out_dir: Path = field(default_factory=lambda: Path("runs"))
     model: str = "mistral-large-4"
@@ -173,6 +198,8 @@ class Recorder:
                     "prompt_cache_key": cache_key,
                     "notes_file": str(notes.path) if notes is not None else None,
                     "normalized_coordinates": config.normalized_coordinates,
+                    "snap_to_tile": config.snap_to_tile,
+                    "grid_overlay": config.grid_overlay,
                     "max_steps": config.max_steps,
                     "max_images": config.max_images,
                     "action_delay": config.action_delay,
@@ -307,6 +334,8 @@ class HarnessLoop:
         self.step_index = 0
         self.final_text: str | None = None
         self._closed = False
+        self.grid: IsoGrid | None = None
+        self._drop_zone_tiles: list[tuple[float, float]] | None = None
 
         if self.config.console:
             print(f"Target  [{target.monitor or '?'}] {target.label}")
@@ -316,7 +345,11 @@ class HarnessLoop:
                 print(f"Notes   {notes.path} ({notes.char_count} chars loaded)")
             print(f"Output  {self.recorder.root}")
 
-        system_prompt = build_system_prompt(self.config.normalized_coordinates)
+        system_prompt = build_system_prompt(
+            self.config.normalized_coordinates,
+            snap_to_tile=self.config.snap_to_tile,
+            grid_overlay=self.config.grid_overlay,
+        )
         if notes is not None:
             rendered_notes = notes.render_for_prompt()
             if rendered_notes:
@@ -335,6 +368,29 @@ class HarnessLoop:
     def _capture(self) -> Frame:
         frame = self.backend.capture_window(self.target.id)
         self.target = frame.window
+
+        # Calibrate the grid lazily on the first capture when either
+        # snap-to-tile or grid-overlay is enabled.  During deployment the
+        # tan drop-zone tiles are visible and provide a good calibration.
+        if self.grid is None and (
+            self.config.snap_to_tile or self.config.grid_overlay
+        ):
+            self._calibrate_grid(frame)
+
+        # Apply the grid overlay to the screenshot returned to the model.
+        if self.config.grid_overlay and self.grid is not None:
+            highlighted = None
+            if self._drop_zone_tiles:
+                highlighted = self._drop_zone_tiles
+            frame = replace(
+                frame,
+                png=annotate_grid(
+                    frame.png,
+                    self.grid,
+                    highlight_tiles=highlighted,
+                ),
+            )
+
         self.frame = frame
         path = self.recorder.save_frame(frame)
         self.last_frame_path = path
@@ -346,6 +402,30 @@ class HarnessLoop:
                 f"{path.relative_to(self.recorder.root)}"
             )
         return frame
+
+    def _calibrate_grid(self, frame: Frame) -> None:
+        """Calibrate the isometric grid from the current screenshot."""
+        grid = calibrate_grid(frame.png, frame.width, frame.height)
+        if grid is not None:
+            self.grid = grid
+            # Cache drop-zone tiles for the overlay highlight.
+            self._drop_zone_tiles = detect_drop_zone_tiles(frame.png)
+            if self.config.console:
+                print(
+                    f"  grid calibrated: origin=({grid.origin_x:.0f},"
+                    f"{grid.origin_y:.0f}) tile={2*grid.tile_w2:.0f}x"
+                    f"{2*grid.tile_h2:.0f} "
+                    f"({len(self._drop_zone_tiles)} drop-zone tiles)"
+                )
+        else:
+            # Fall back to the default grid (measured for 1280×720).
+            self.grid = default_grid(frame.width, frame.height)
+            if self.config.console:
+                print(
+                    f"  grid default: origin=({self.grid.origin_x:.0f},"
+                    f"{self.grid.origin_y:.0f}) tile="
+                    f"{2*self.grid.tile_w2:.0f}x{2*self.grid.tile_h2:.0f}"
+                )
 
     def _prune_images(self) -> None:
         # Keep the latest screenshots and replace older tool-message images
@@ -386,6 +466,44 @@ class HarnessLoop:
                 f"Point ({x}, {y}) is outside the screenshot "
                 f"{frame.width}x{frame.height}."
             )
+
+    # ------------------------------------------------------------------
+    # Tile snapping
+    # ------------------------------------------------------------------
+
+    # Maximum distance (px) from a tile centre for snapping to apply.
+    # Clicks farther away are assumed to target UI elements, not tiles.
+    _SNAP_MAX_DIST = 60.0
+
+    def _ensure_grid(self, frame: Frame) -> IsoGrid:
+        """Return the calibrated grid, calibrating lazily if needed.
+
+        Normally the grid is calibrated in ``_capture`` on the first
+        frame.  This is a fallback for the case where a click arrives
+        before any capture (shouldn't happen, but be safe).
+        """
+        if self.grid is not None:
+            return self.grid
+        self._calibrate_grid(frame)
+        assert self.grid is not None
+        return self.grid
+
+    def _snap_point(
+        self, frame: Frame, x: int, y: int
+    ) -> tuple[int, int, int, int] | None:
+        """Snap a screenshot pixel to the nearest tile centre.
+
+        Returns ``(snapped_x, snapped_y, row, col)`` or ``None`` if the
+        point is too far from any tile centre (likely a UI click).
+        """
+        if not self.config.snap_to_tile:
+            return None
+        grid = self._ensure_grid(frame)
+        sx, sy, row, col = grid.snap(x, y)
+        dist = ((sx - x) ** 2 + (sy - y) ** 2) ** 0.5
+        if dist > self._SNAP_MAX_DIST:
+            return None
+        return sx, sy, row, col
 
     def _execute_tool(
         self, call: ModelToolCall
@@ -439,6 +557,17 @@ class HarnessLoop:
                 else:
                     x, y = int(round(x)), int(round(y))
                 self._validate_point(frame, x, y)
+                # Snap to the nearest tile centre if enabled.
+                snap_info: str = ""
+                snapped = self._snap_point(frame, x, y)
+                if snapped is not None:
+                    nx, ny, row, col = snapped
+                    if (nx, ny) != (x, y):
+                        snap_info = (
+                            f" Snapped to tile ({row}, {col}) "
+                            f"at pixel ({nx}, {ny})."
+                        )
+                        x, y = nx, ny
                 sx = frame.window.x + x
                 sy = frame.window.y + y
                 self.input.click(sx, sy)
@@ -453,7 +582,8 @@ class HarnessLoop:
                         ok=True,
                         message=(
                             f"Clicked screenshot pixel ({x}, {y}) "
-                            f"at screen ({sx}, {sy}). Marked screenshot "
+                            f"at screen ({sx}, {sy}).{snap_info} "
+                            f"Marked screenshot "
                             f"attached ({frame.width}x{frame.height})."
                         ),
                         image_png=marked_png,
@@ -474,6 +604,17 @@ class HarnessLoop:
                 else:
                     x, y = int(round(x)), int(round(y))
                 self._validate_point(frame, x, y)
+                # Snap inspect to the nearest tile centre if enabled.
+                snap_info = ""
+                snapped = self._snap_point(frame, x, y)
+                if snapped is not None:
+                    nx, ny, row, col = snapped
+                    if (nx, ny) != (x, y):
+                        snap_info = (
+                            f" Snapped to tile ({row}, {col}) "
+                            f"at pixel ({nx}, {ny})."
+                        )
+                        x, y = nx, ny
                 sx = frame.window.x + x
                 sy = frame.window.y + y
                 self.input.hover(sx, sy)
@@ -493,6 +634,7 @@ class HarnessLoop:
                             f"captured a {frame.width}x{frame.height} "
                             "screenshot"
                             + (" with details." if with_details else ".")
+                            + snap_info
                         ),
                         image_png=frame.png,
                         pixel=(x, y),
@@ -850,6 +992,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--snap-to-tile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Snap click/inspect coordinates to the nearest board tile centre. "
+            "The grid is calibrated from the drop-zone tiles during deployment "
+            "and reused for the rest of the game (default: off)."
+        ),
+    )
+    parser.add_argument(
+        "--grid-overlay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Draw the isometric tile grid with pixel-coordinate labels on "
+            "every screenshot. Drop-zone tiles are highlighted in gold during "
+            "deployment. Implies grid calibration (default: off)."
+        ),
+    )
+    parser.add_argument(
         "--max-images",
         type=int,
         default=4,
@@ -977,6 +1139,8 @@ def main(argv: list[str] | None = None) -> int:
             action_delay=max(0.0, args.action_delay),
             show_thinking=args.show_thinking,
             normalized_coordinates=args.normalize_coordinates,
+            snap_to_tile=args.snap_to_tile,
+            grid_overlay=args.grid_overlay,
             console=not args.web,
             out_dir=args.out.expanduser(),
             model=agent.model,

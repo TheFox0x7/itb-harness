@@ -16,6 +16,7 @@ from itb_harness.agent import (
     ScriptedAgent,
 )
 from itb_harness.capture import Frame, MonitorInfo, WindowInfo
+from itb_harness.grid import default_grid
 from itb_harness.input import InputEvent, StubInput
 from itb_harness.loop import HarnessLoop, LoopConfig
 from itb_harness.notes import NotesStore
@@ -25,6 +26,40 @@ def tiny_png() -> bytes:
     buffer = BytesIO()
     Image.new("RGB", (10, 10), (0, 0, 0)).save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def deployment_png(width: int = 1280, height: int = 720) -> bytes:
+    """Synthetic deployment screenshot with tan drop-zone tiles."""
+    from PIL import ImageDraw
+
+    grid = default_grid(width, height)
+    img = Image.new("RGB", (width, height), (20, 20, 20))
+    draw = ImageDraw.Draw(img)
+
+    # Board diamond (bright area).
+    cx = grid.origin_x
+    cy = grid.origin_y + 7 * grid.tile_h2
+    half_w = int(4 * 2 * grid.tile_w2)
+    half_h = int(4 * 2 * grid.tile_h2)
+    draw.polygon(
+        [(cx, cy - half_h), (cx + half_w, cy), (cx, cy + half_h), (cx - half_w, cy)],
+        fill=(60, 65, 55),
+    )
+
+    # Tan drop-zone tiles with gaps (so erosion separates them).
+    tan = (140, 140, 90)
+    for row, col in [(3, 3), (3, 4), (4, 4), (4, 5), (5, 5)]:
+        tx, ty = grid.tile_center(row, col)
+        tw = int(2 * grid.tile_w2 * 0.88)
+        th = int(2 * grid.tile_h2 * 0.88)
+        draw.polygon(
+            [(tx, ty - th // 2), (tx + tw // 2, ty), (tx, ty + th // 2), (tx - tw // 2, ty)],
+            fill=tan,
+        )
+
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 WINDOW = WindowInfo(
@@ -46,9 +81,10 @@ WINDOW = WindowInfo(
 class FakeBackend:
     name = "fake"
 
-    def __init__(self) -> None:
+    def __init__(self, png: bytes | None = None) -> None:
         self.captures = 0
         self.window = WINDOW
+        self._png = png or tiny_png()
 
     def list_monitors(self) -> list[MonitorInfo]:
         return [
@@ -64,7 +100,7 @@ class FakeBackend:
         self.captures += 1
         return Frame(
             window=self.window,
-            png=tiny_png(),
+            png=self._png,
             width=self.window.width,
             height=self.window.height,
             captured_at="2026-10-22T00:00:00+00:00",
@@ -94,6 +130,22 @@ def call(name: str, arguments: dict | None = None, id: str = "call-1"):
     return ModelToolCall(id=id, name=name, arguments=arguments or {})
 
 
+WINDOW_1280 = WindowInfo(
+    id="{game}",
+    title="Into the Breach",
+    app_id="Breach",
+    pid=1234,
+    x=86,
+    y=48,
+    width=1280,
+    height=720,
+    monitor="gamescope",
+    active=True,
+    minimized=False,
+    fullscreen=False,
+)
+
+
 def run_loop(
     turns: list[ModelTurn],
     tmp: Path,
@@ -102,13 +154,19 @@ def run_loop(
     action_delay: float = 0.0,
     notes: NotesStore | None = None,
     normalized: bool = False,
+    snap_to_tile: bool = False,
+    grid_overlay: bool = False,
+    png: bytes | None = None,
+    window: WindowInfo | None = None,
 ) -> tuple[HarnessLoop, object, StubInput]:
-    backend = FakeBackend()
+    win = window or WINDOW
+    backend = FakeBackend(png=png)
+    backend.window = win
     agent = ScriptedAgent(turns)
     pointer = StubInput()
     loop = HarnessLoop(
         backend,
-        WINDOW,
+        win,
         agent,
         pointer,
         LoopConfig(
@@ -116,6 +174,8 @@ def run_loop(
             max_images=max_images,
             action_delay=action_delay,
             normalized_coordinates=normalized,
+            snap_to_tile=snap_to_tile,
+            grid_overlay=grid_overlay,
             out_dir=tmp,
         ),
         notes=notes,
@@ -497,6 +557,184 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(len(turn.tool_calls), 1)
         self.assertEqual(turn.tool_calls[0].name, "view_board")
         self.assertEqual(turn.tool_calls[0].arguments, {})
+
+    def test_snap_to_tile_snaps_click(self) -> None:
+        """With snap_to_tile, a click near a tile centre is snapped to it."""
+        grid = default_grid(1280, 720)
+        # Target tile (4, 4) centre.
+        tx, ty = grid.tile_center(4, 4)
+        # Click 15px away from the centre (within snap threshold).
+        click_x, click_y = tx + 15, ty - 10
+
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(
+                tool_calls=(call("click", {"point_2d": [click_x, click_y]}),)
+            ),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(
+                turns,
+                Path(tmp),
+                snap_to_tile=True,
+                png=deployment_png(),
+                window=WINDOW_1280,
+            )
+            # The click should have been snapped to the tile centre.
+            # Screen coords = window offset + screenshot pixel.
+            expected_sx = WINDOW_1280.x + tx
+            expected_sy = WINDOW_1280.y + ty
+            self.assertEqual(
+                [(event.kind, event.x, event.y) for event in pointer.events],
+                [("click", expected_sx, expected_sy)],
+            )
+            # The action record should show the snapped pixel.
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(records[1]["pixel"], [tx, ty])
+            self.assertIn("Snapped to tile (4, 4)", records[1]["message"])
+
+    def test_snap_to_tile_disabled_by_default(self) -> None:
+        """Without snap_to_tile, clicks are not modified."""
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("click", {"point_2d": [500, 400]}),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(
+                turns,
+                Path(tmp),
+                png=deployment_png(),
+                window=WINDOW_1280,
+            )
+            # Click should be at the exact requested pixel (no snapping).
+            self.assertEqual(
+                [(event.kind, event.x, event.y) for event in pointer.events],
+                [("click", WINDOW_1280.x + 500, WINDOW_1280.y + 400)],
+            )
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(records[1]["pixel"], [500, 400])
+            self.assertNotIn("Snapped", records[1]["message"])
+
+    def test_snap_to_tile_far_click_not_snapped(self) -> None:
+        """Clicks far from any tile (e.g. UI buttons) are not snapped."""
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            # Click in the bottom-left corner (UI area, far from tiles).
+            ModelTurn(tool_calls=(call("click", {"point_2d": [50, 700]}),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(
+                turns,
+                Path(tmp),
+                snap_to_tile=True,
+                png=deployment_png(),
+                window=WINDOW_1280,
+            )
+            # Click should NOT be snapped (too far from any tile).
+            self.assertEqual(
+                [(event.kind, event.x, event.y) for event in pointer.events],
+                [("click", WINDOW_1280.x + 50, WINDOW_1280.y + 700)],
+            )
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(records[1]["pixel"], [50, 700])
+            self.assertNotIn("Snapped", records[1]["message"])
+
+    def test_grid_overlay_annotates_screenshots(self) -> None:
+        """With grid_overlay, screenshots returned to the model have the
+        tile grid drawn on them (different bytes than the raw capture)."""
+        raw_png = deployment_png()
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(
+                turns,
+                Path(tmp),
+                grid_overlay=True,
+                png=raw_png,
+                window=WINDOW_1280,
+            )
+            # The saved frame should differ from the raw capture (overlay
+            # adds grid lines and labels).
+            saved = (result.run_dir / "frames" / "0001.png").read_bytes()
+            self.assertNotEqual(saved, raw_png)
+            # Grid should be calibrated.
+            self.assertIsNotNone(loop.grid)
+            # Drop zone tiles should be cached for highlighting.
+            self.assertIsNotNone(loop._drop_zone_tiles)
+            self.assertGreater(len(loop._drop_zone_tiles), 0)
+
+    def test_grid_overlay_disabled_by_default(self) -> None:
+        """Without grid_overlay, screenshots are not annotated."""
+        raw_png = deployment_png()
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(
+                turns,
+                Path(tmp),
+                png=raw_png,
+                window=WINDOW_1280,
+            )
+            saved = (result.run_dir / "frames" / "0001.png").read_bytes()
+            self.assertEqual(saved, raw_png)
+
+    def test_grid_overlay_and_snap_combined(self) -> None:
+        """Grid overlay + snap-to-tile work together."""
+        grid = default_grid(1280, 720)
+        tx, ty = grid.tile_center(4, 4)
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(
+                tool_calls=(call("click", {"point_2d": [tx + 10, ty - 8]}),)
+            ),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(
+                turns,
+                Path(tmp),
+                snap_to_tile=True,
+                grid_overlay=True,
+                png=deployment_png(),
+                window=WINDOW_1280,
+            )
+            # Click should be snapped to the tile centre.
+            self.assertEqual(
+                [(event.kind, event.x, event.y) for event in pointer.events],
+                [("click", WINDOW_1280.x + tx, WINDOW_1280.y + ty)],
+            )
+            # Screenshots should have the overlay.
+            saved = (result.run_dir / "frames" / "0001.png").read_bytes()
+            self.assertNotEqual(saved, deployment_png())
+
+    def test_system_prompt_includes_grid_overlay_note(self) -> None:
+        """The system prompt mentions the grid overlay when enabled."""
+        from itb_harness.loop import build_system_prompt
+
+        prompt = build_system_prompt(
+            normalized=False, grid_overlay=True
+        )
+        self.assertIn("tile grid overlay", prompt)
+        self.assertIn("pixel coordinates", prompt)
+
+        prompt_off = build_system_prompt(normalized=False, grid_overlay=False)
+        self.assertNotIn("tile grid overlay", prompt_off)
 
 
 if __name__ == "__main__":
