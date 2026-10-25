@@ -6,36 +6,35 @@ from itb_harness.board_tools import tool_schemas
 from itb_harness.loop import build_system_prompt
 
 
-class CoordinateModeTests(unittest.TestCase):
-    def _click_schema(self, normalized: bool):
-        tools = tool_schemas(normalized=normalized)
-        return next(
-            tool for tool in tools if tool["function"]["name"] == "click"
-        )["function"]["parameters"]["properties"]["point_2d"]
+class ToolSchemaTests(unittest.TestCase):
+    def test_tool_set_is_observation_plus_four_directions(self) -> None:
+        names = [tool["function"]["name"] for tool in tool_schemas()]
+        self.assertEqual(
+            names,
+            [
+                "view_board",
+                "move_up",
+                "move_down",
+                "move_left",
+                "move_right",
+            ],
+        )
 
-    def test_pixel_schema(self) -> None:
-        point = self._click_schema(False)
-        self.assertEqual(point["items"]["type"], "integer")
-        self.assertNotIn("maximum", point["items"])
-
-    def test_normalized_schema(self) -> None:
-        point = self._click_schema(True)
-        self.assertEqual(point["items"]["type"], "number")
-        self.assertEqual(point["items"]["maximum"], 1000)
-
-    def test_system_prompt_coordinate_mode(self) -> None:
-        self.assertIn("screenshot pixels", build_system_prompt(False))
-        self.assertIn("normalized from 0 to 1000", build_system_prompt(True))
-
-    def test_hover_and_inspect_schemas(self) -> None:
+    def test_movement_schema_is_batchable(self) -> None:
         tools = {
             tool["function"]["name"]: tool for tool in tool_schemas()
         }
-        self.assertIn("hover", tools)
-        self.assertNotIn(
-            "with_details",
-            tools["inspect"]["function"]["parameters"]["properties"],
-        )
+        for name in ("move_up", "move_down", "move_left", "move_right"):
+            steps = tools[name]["function"]["parameters"]["properties"]["steps"]
+            self.assertEqual(steps["minimum"], 1)
+            self.assertEqual(steps["maximum"], 50)
+            self.assertEqual(steps["default"], 1)
+
+    def test_system_prompt_mentions_batched_movement(self) -> None:
+        prompt = build_system_prompt()
+        self.assertIn("move_up", prompt)
+        self.assertIn("steps", prompt)
+        self.assertIn("one tile", prompt)
 
 
 if __name__ == "__main__":

@@ -53,6 +53,7 @@ function formatArgs(args) {
     const suffix = args.with_details ? " +details" : "";
     return `(${point[0]}, ${point[1]})${suffix}`;
   }
+  if (typeof args.steps !== "undefined") return `×${args.steps}`;
   if (typeof args.number !== "undefined") return `#${args.number}`;
   if (typeof args.text === "string") {
     const text = args.text.replace(/\s+/g, " ").trim();

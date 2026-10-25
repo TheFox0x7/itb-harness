@@ -4,7 +4,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from itb_harness.board_tools import parse_note_args, tool_schemas
 from itb_harness.notes import NotesStore
 
 
@@ -47,26 +46,6 @@ class NotesStoreTests(unittest.TestCase):
             store = NotesStore(Path(tmp) / "notes.md")
             with self.assertRaises(ValueError):
                 store.append("   ")
-
-
-class NoteToolTests(unittest.TestCase):
-    def test_note_schema_is_optional(self) -> None:
-        base = [tool["function"]["name"] for tool in tool_schemas()]
-        with_note = [
-            tool["function"]["name"] for tool in tool_schemas(include_note=True)
-        ]
-        self.assertNotIn("note", base)
-        self.assertIn("note", with_note)
-
-    def test_parse_note_args(self) -> None:
-        self.assertEqual(
-            parse_note_args({"text": "  useful fact  "}),
-            "useful fact",
-        )
-        with self.assertRaises(ValueError):
-            parse_note_args({"text": ""})
-        with self.assertRaises(ValueError):
-            parse_note_args({"text": "x" * 2001})
 
 
 if __name__ == "__main__":

@@ -74,7 +74,7 @@ class SessionRunnerTests(unittest.TestCase):
     def test_step_pauses_and_runs_one_turn(self) -> None:
         turns = [
             ModelTurn(tool_calls=(call("view_board"),)),
-            ModelTurn(tool_calls=(call("click", {"point_2d": [50, 50]}),)),
+            ModelTurn(tool_calls=(call("move_up", {"steps": 1}),)),
             ModelTurn(content="done"),
         ]
         with tempfile.TemporaryDirectory() as tmp:

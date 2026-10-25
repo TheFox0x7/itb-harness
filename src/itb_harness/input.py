@@ -135,6 +135,10 @@ class X11Input:
             "shift": self._XK.XK_Shift_L,
             "ctrl": self._XK.XK_Control_L,
             "alt": self._XK.XK_Alt_L,
+            "up": self._XK.XK_Up,
+            "down": self._XK.XK_Down,
+            "left": self._XK.XK_Left,
+            "right": self._XK.XK_Right,
         }
         keysym = named.get(key)
         if keysym is None:
