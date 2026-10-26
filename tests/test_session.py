@@ -74,7 +74,7 @@ class SessionRunnerTests(unittest.TestCase):
     def test_step_pauses_and_runs_one_turn(self) -> None:
         turns = [
             ModelTurn(tool_calls=(call("view_board"),)),
-            ModelTurn(tool_calls=(call("move_up", {"steps": 1}),)),
+            ModelTurn(tool_calls=(call("move_up"),)),
             ModelTurn(content="done"),
         ]
         with tempfile.TemporaryDirectory() as tmp:
@@ -165,6 +165,29 @@ class SessionRunnerTests(unittest.TestCase):
             self.assertEqual(snapshot["phase"], "stopped")
             self.assertEqual(snapshot["thinking"], "considering the board")
             self.assertIsNotNone(snapshot["last_activity_age_ms"])
+
+    def test_steering_is_queued_for_next_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = HarnessLoop(
+                FakeBackend(),
+                WINDOW,
+                ScriptedAgent([ModelTurn(content="done")]),
+                StubInput(),
+                LoopConfig(action_delay=0, out_dir=Path(tmp)),
+            )
+            runner = SessionRunner(loop)
+            runner.start()
+            self.assertTrue(runner.steer("move toward the exit"))
+            self.assertEqual(runner.snapshot()["pending_guidance"], 1)
+            self.assertTrue(runner.step())
+            wait_for(lambda: runner.snapshot()["state"] == "stopped")
+            self.assertEqual(runner.snapshot()["pending_guidance"], 0)
+            combined = "\n".join(
+                message["content"]
+                for message in loop.messages
+                if message.get("role") == "user"
+            )
+            self.assertIn("move toward the exit", combined)
 
     def test_stop_while_paused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

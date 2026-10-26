@@ -1,22 +1,36 @@
-"""Observation and movement tools exposed to the model."""
+"""Observation, movement, and overlay tools exposed to the model."""
 
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .annotate import BoxAnnotation
 
-class MoveArgs(BaseModel):
+
+STRICT_BOX_LABELS = (
+    "spike trap",
+    "skeleton",
+    "rock",
+    "demon",
+    "helltaker",
+)
+
+
+class BoxItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    steps: int = Field(
-        default=1,
-        ge=1,
-        le=50,
-        description="Number of tiles to move in this batch.",
-    )
+    box_2d: list[float] = Field(min_length=4, max_length=4)
+    label: str = Field(min_length=1)
+
+
+class BoxesArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    boxes: list[BoxItem] = Field(default_factory=list)
 
 
 _EMPTY_SCHEMA = {
@@ -25,67 +39,127 @@ _EMPTY_SCHEMA = {
     "additionalProperties": False,
 }
 
-_MOVE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "steps": {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 50,
-            "default": 1,
-            "description": "Number of tiles to move in this batch.",
-        }
-    },
-    "required": [],
-    "additionalProperties": False,
-}
 
-
-def _tool(name: str, description: str, parameters: dict[str, Any]) -> dict[str, Any]:
+def _tool(
+    name: str,
+    description: str,
+    parameters: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "type": "function",
         "function": {
             "name": name,
             "description": description,
-            "parameters": parameters,
+            "parameters": parameters or _EMPTY_SCHEMA,
         },
     }
 
 
-def tool_schemas() -> list[dict[str, Any]]:
+def _boxes_schema(
+    strict_labels: bool, scaled_boxes: bool = False
+) -> dict[str, Any]:
+    label: dict[str, Any] = {
+        "type": "string",
+        "minLength": 1,
+        "description": "Short label describing the boxed object.",
+    }
+    if strict_labels:
+        label["enum"] = list(STRICT_BOX_LABELS)
+        label["description"] = (
+            "One of: " + ", ".join(STRICT_BOX_LABELS) + "."
+        )
+    return {
+        "type": "object",
+        "properties": {
+            "boxes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "box_2d": {
+                            "type": "array",
+                            "items": (
+                                {
+                                    "type": "number",
+                                    "minimum": 1,
+                                    "maximum": 1000,
+                                }
+                                if scaled_boxes
+                                else {"type": "number"}
+                            ),
+                            "minItems": 4,
+                            "maxItems": 4,
+                            "description": (
+                                "[xmin, ymin, xmax, ymax] in scaled "
+                                "coordinates from 1 to 1000."
+                                if scaled_boxes
+                                else "[xmin, ymin, xmax, ymax] in screenshot "
+                                "pixels."
+                            ),
+                        },
+                        "label": label,
+                    },
+                    "required": ["box_2d", "label"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["boxes"],
+        "additionalProperties": False,
+    }
+
+
+def tool_schemas(
+    strict_labels: bool = False, scaled_boxes: bool = False
+) -> list[dict[str, Any]]:
     """Return the tool definitions visible to the model."""
 
-    move_schema = _MOVE_SCHEMA
+    coordinate_text = (
+        "scaled coordinates from 1 to 1000"
+        if scaled_boxes
+        else "screenshot pixels"
+    )
     return [
         _tool(
             "view_board",
             "Capture and return the current game screenshot. Call this first "
             "and after movement when you need to see the result.",
-            _EMPTY_SCHEMA,
         ),
         _tool(
             "move_up",
-            "Move upward by pressing the Up arrow. Set steps to move several "
-            "tiles in one batch.",
-            move_schema,
+            "Move one tile upward by pressing the Up arrow.",
         ),
         _tool(
             "move_down",
-            "Move downward by pressing the Down arrow. Set steps to move "
-            "several tiles in one batch.",
-            move_schema,
+            "Move one tile downward by pressing the Down arrow.",
         ),
         _tool(
             "move_left",
-            "Move left by pressing the Left arrow. Set steps to move several "
-            "tiles in one batch.",
-            move_schema,
+            "Move one tile left by pressing the Left arrow.",
         ),
         _tool(
             "move_right",
-            "Move right by pressing the Right arrow. Set steps to move several "
-            "tiles in one batch.",
-            move_schema,
+            "Move one tile right by pressing the Right arrow.",
+        ),
+        _tool(
+            "reset_level",
+            "Restart the current level by pressing R. Use this when a plan "
+            "fails or you are stuck, then try a better plan.",
+        ),
+        _tool(
+            "set_boxes",
+            "Replace the persistent bounding-box overlay on screenshots. "
+            f"Coordinates are {coordinate_text} as "
+            "[xmin, ymin, xmax, ymax]. The overlay remains on every future "
+            "screenshot until the next set_boxes or add_boxes call.",
+            _boxes_schema(strict_labels, scaled_boxes),
+        ),
+        _tool(
+            "add_boxes",
+            "Append bounding boxes to the persistent overlay without removing "
+            f"existing boxes. Coordinates are {coordinate_text} as "
+            "[xmin, ymin, xmax, ymax].",
+            _boxes_schema(strict_labels, scaled_boxes),
         ),
     ]
 
@@ -101,12 +175,71 @@ def _load_object(arguments: Any) -> dict[str, Any]:
     return arguments
 
 
-def parse_move_args(arguments: Any) -> int:
+def _scaled_to_pixel(value: float, size: int) -> int:
+    if size <= 1:
+        return 0
+    pixel = int(round((value - 1) / 999.0 * (size - 1)))
+    return max(0, min(size - 1, pixel))
+
+
+def parse_boxes_args(
+    arguments: Any,
+    strict_labels: bool = False,
+    scaled_boxes: bool = False,
+    width: int | None = None,
+    height: int | None = None,
+) -> list[BoxAnnotation]:
     try:
-        parsed = MoveArgs.model_validate(_load_object(arguments))
+        parsed = BoxesArgs.model_validate(_load_object(arguments))
     except ValidationError as exc:
         raise ValueError(_format_validation(exc)) from exc
-    return parsed.steps
+
+    boxes: list[BoxAnnotation] = []
+    for item in parsed.boxes:
+        xmin, ymin, xmax, ymax = item.box_2d
+        if not all(math.isfinite(value) for value in item.box_2d):
+            raise ValueError("Bounding-box coordinates must be finite.")
+        if xmax <= xmin or ymax <= ymin:
+            raise ValueError(
+                "Bounding box must satisfy xmin < xmax and ymin < ymax."
+            )
+        if scaled_boxes:
+            if width is None or height is None:
+                raise ValueError(
+                    "Scaled bounding boxes require screenshot dimensions."
+                )
+            if not all(1 <= value <= 1000 for value in item.box_2d):
+                raise ValueError(
+                    "Scaled bounding-box coordinates must be in 1..1000."
+                )
+            xmin, ymin, xmax, ymax = (
+                _scaled_to_pixel(xmin, width),
+                _scaled_to_pixel(ymin, height),
+                _scaled_to_pixel(xmax, width),
+                _scaled_to_pixel(ymax, height),
+            )
+            if xmax <= xmin or ymax <= ymin:
+                raise ValueError(
+                    "Bounding box is too small after scaling."
+                )
+        label = item.label.strip()
+        if not label:
+            raise ValueError("Bounding-box label cannot be empty.")
+        if strict_labels and label not in STRICT_BOX_LABELS:
+            raise ValueError(
+                "Bounding-box label must be one of: "
+                + ", ".join(STRICT_BOX_LABELS)
+            )
+        boxes.append(
+            BoxAnnotation(
+                xmin=int(round(xmin)),
+                ymin=int(round(ymin)),
+                xmax=int(round(xmax)),
+                ymax=int(round(ymax)),
+                label=label,
+            )
+        )
+    return boxes
 
 
 def _format_validation(exc: ValidationError) -> str:

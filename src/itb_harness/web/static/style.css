@@ -126,6 +126,66 @@ button.primary:hover { background: #258567; }
 .live-follow { margin-left: auto; }
 .live-error { color: var(--error); font-size: 12px; }
 
+.live-steer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 16px;
+  background: #121a1e;
+  border-bottom: 1px solid var(--line);
+}
+
+.live-steer[hidden] { display: none; }
+
+.live-steer label {
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.live-steer input {
+  flex: 1;
+  min-width: 0;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font: inherit;
+}
+
+.live-steer input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.live-steer-status {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.live-guidance {
+  max-height: 18vh;
+  overflow-y: auto;
+  padding: 5px 16px;
+  background: #10161a;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.live-guidance[hidden] { display: none; }
+
+.live-guidance-line {
+  padding: 2px 0;
+  overflow-wrap: anywhere;
+}
+
+.live-guidance-line.sent { color: var(--accent); }
+
 .layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(360px, 42vw);
@@ -351,6 +411,28 @@ button.primary:hover { background: #258567; }
   font-size: 12px;
 }
 
+.guidance {
+  border-top: 1px solid var(--line);
+  padding: 7px 10px;
+  background: #1b2119;
+}
+
+.guidance-title {
+  color: #ffd166;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 3px;
+}
+
+.guidance-line {
+  color: #e6d8a8;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .thinking {
   border-top: 1px solid var(--line);
 }
@@ -413,6 +495,12 @@ button.primary:hover { background: #258567; }
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.action-args.boxes {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  flex: 1 1 auto;
 }
 
 .action-result {

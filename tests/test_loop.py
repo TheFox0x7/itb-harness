@@ -102,6 +102,9 @@ def run_loop(
     max_images: int = 4,
     action_delay: float = 0.0,
     notes: NotesStore | None = None,
+    strict_box_labels: bool = False,
+    scaled_boxes: bool = False,
+    guidance: list[str] | None = None,
     png: bytes | None = None,
     window: WindowInfo | None = None,
 ) -> tuple[HarnessLoop, object, StubInput]:
@@ -119,11 +122,14 @@ def run_loop(
             max_steps=max_steps,
             max_images=max_images,
             action_delay=action_delay,
-            move_delay=0.0,
+            strict_box_labels=strict_box_labels,
+            scaled_boxes=scaled_boxes,
             out_dir=tmp,
         ),
         notes=notes,
     )
+    for text in guidance or []:
+        loop.add_guidance(text)
     result = loop.run()
     return loop, result, pointer
 
@@ -132,19 +138,19 @@ class LoopTests(unittest.TestCase):
     def test_view_move_view_flow(self) -> None:
         turns = [
             ModelTurn(tool_calls=(call("view_board"),)),
-            ModelTurn(tool_calls=(call("move_up", {"steps": 3}),)),
+            ModelTurn(tool_calls=(call("move_up"),)),
             ModelTurn(tool_calls=(call("view_board"),)),
             ModelTurn(content="done"),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             loop, result, pointer = run_loop(turns, Path(tmp))
             self.assertEqual(result.steps, 4)
-            self.assertEqual(result.actions, 3)
+            self.assertEqual(result.actions, 1)
             self.assertEqual(result.frames, 3)
             self.assertEqual(result.stopped, "model_stopped")
             self.assertEqual(
                 pointer.events,
-                [InputEvent("key", key="up") for _ in range(3)],
+                [InputEvent("key", key="up")],
             )
             records = [
                 json.loads(line)
@@ -154,56 +160,252 @@ class LoopTests(unittest.TestCase):
                 [record["tool"] for record in records],
                 ["view_board", "move_up", "view_board"],
             )
-            self.assertEqual(records[1]["arguments"], {"steps": 3})
+            self.assertEqual(records[1]["arguments"], {})
             self.assertEqual(records[1]["frame"], "frames/0002.png")
             self.assertEqual(records[1]["source_frame"], "frames/0001.png")
             self.assertFalse(records[1]["state_changed"])
             self.assertIn("not sent", records[1]["message"])
 
-    def test_all_directions_are_batchable(self) -> None:
+    def test_reset_level_presses_r(self) -> None:
         turns = [
             ModelTurn(tool_calls=(call("view_board"),)),
-            ModelTurn(tool_calls=(call("move_up", {"steps": 2}),)),
-            ModelTurn(tool_calls=(call("move_down", {"steps": 1}),)),
-            ModelTurn(tool_calls=(call("move_left", {"steps": 4}),)),
-            ModelTurn(tool_calls=(call("move_right", {"steps": 1}),)),
+            ModelTurn(tool_calls=(call("reset_level"),)),
             ModelTurn(content="done"),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             loop, result, pointer = run_loop(turns, Path(tmp))
-            self.assertEqual(result.actions, 8)
+            self.assertEqual(result.actions, 1)
+            self.assertEqual(result.frames, 2)
+            self.assertEqual(pointer.events, [InputEvent("key", key="r")])
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(records[1]["tool"], "reset_level")
+            self.assertEqual(records[1]["frame"], "frames/0002.png")
+            self.assertIn("Level reset", records[1]["message"])
+
+    def test_reset_level_clears_overlay(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(
+                tool_calls=(
+                    call(
+                        "set_boxes",
+                        {
+                            "boxes": [
+                                {"box_2d": [1, 1, 6, 6], "label": "demon"}
+                            ]
+                        },
+                    ),
+                )
+            ),
+            ModelTurn(tool_calls=(call("reset_level"),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(turns, Path(tmp))
+            self.assertEqual(result.frames, 3)
+            self.assertEqual(loop.box_overlay, [])
+            raw = (result.run_dir / "frames" / "0001.png").read_bytes()
+            self.assertEqual(
+                (result.run_dir / "frames" / "0003.png").read_bytes(),
+                raw,
+            )
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            self.assertIn("overlay cleared", records[2]["message"])
+
+    def test_all_directions_move_one_tile(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("move_up"),)),
+            ModelTurn(tool_calls=(call("move_down"),)),
+            ModelTurn(tool_calls=(call("move_left"),)),
+            ModelTurn(tool_calls=(call("move_right"),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(turns, Path(tmp))
+            self.assertEqual(result.actions, 4)
             self.assertEqual(result.frames, 5)
             self.assertEqual(
                 [event.key for event in pointer.events],
-                ["up", "up", "down", "left", "left", "left", "left", "right"],
+                ["up", "down", "left", "right"],
             )
             records = [
                 json.loads(line)
                 for line in (result.run_dir / "actions.jsonl").read_text().splitlines()
             ]
             self.assertEqual(
-                [record["arguments"].get("steps") for record in records[1:]],
-                [2, 1, 4, 1],
+                [record["arguments"] for record in records[1:]],
+                [{}, {}, {}, {}],
             )
 
-    def test_invalid_steps_are_rejected(self) -> None:
+    def test_boxes_overlay_persists_and_replaces(self) -> None:
         turns = [
-            ModelTurn(tool_calls=(call("move_up", {"steps": 0}),)),
-            ModelTurn(tool_calls=(call("move_down", {"steps": 51}),)),
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(
+                tool_calls=(
+                    call(
+                        "set_boxes",
+                        {
+                            "boxes": [
+                                {
+                                    "box_2d": [1, 1, 6, 6],
+                                    "label": "skeleton",
+                                }
+                            ]
+                        },
+                    ),
+                )
+            ),
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("move_up"),)),
+            ModelTurn(tool_calls=(call("set_boxes", {"boxes": []}),)),
+            ModelTurn(tool_calls=(call("view_board"),)),
             ModelTurn(content="done"),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             loop, result, pointer = run_loop(turns, Path(tmp))
-            self.assertEqual(pointer.events, [])
-            self.assertEqual(result.frames, 0)
+            self.assertEqual(result.frames, 6)
+            self.assertEqual(len(loop.box_overlay), 0)
+            frames = result.run_dir / "frames"
+            raw = (frames / "0001.png").read_bytes()
+            self.assertNotEqual((frames / "0002.png").read_bytes(), raw)
+            self.assertNotEqual((frames / "0003.png").read_bytes(), raw)
+            self.assertNotEqual((frames / "0004.png").read_bytes(), raw)
+            self.assertEqual((frames / "0006.png").read_bytes(), raw)
+
+    def test_add_boxes_appends_without_clearing(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(
+                tool_calls=(
+                    call(
+                        "set_boxes",
+                        {
+                            "boxes": [
+                                {"box_2d": [1, 1, 4, 4], "label": "skeleton"}
+                            ]
+                        },
+                    ),
+                )
+            ),
+            ModelTurn(
+                tool_calls=(
+                    call(
+                        "add_boxes",
+                        {
+                            "boxes": [
+                                {"box_2d": [5, 5, 8, 8], "label": "demon"}
+                            ]
+                        },
+                    ),
+                )
+            ),
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(turns, Path(tmp))
+            self.assertEqual(result.frames, 4)
+            self.assertEqual(
+                [box.label for box in loop.box_overlay],
+                ["skeleton", "demon"],
+            )
             records = [
                 json.loads(line)
                 for line in (result.run_dir / "actions.jsonl").read_text().splitlines()
             ]
-            self.assertEqual([record["error"] for record in records], [
-                "invalid_arguments",
-                "invalid_arguments",
-            ])
+            self.assertEqual(records[2]["tool"], "add_boxes")
+            self.assertIn("overlay now has 2", records[2]["message"])
+
+    def test_scaled_boxes_convert_to_pixels(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(
+                tool_calls=(
+                    call(
+                        "set_boxes",
+                        {
+                            "boxes": [
+                                {
+                                    "box_2d": [1, 1, 1000, 1000],
+                                    "label": "helltaker",
+                                }
+                            ]
+                        },
+                    ),
+                )
+            ),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(
+                turns, Path(tmp), scaled_boxes=True
+            )
+            box = loop.box_overlay[0]
+            self.assertEqual(
+                (box.xmin, box.ymin, box.xmax, box.ymax),
+                (0, 0, WINDOW.width - 1, WINDOW.height - 1),
+            )
+
+    def test_boxes_require_a_frame(self) -> None:
+        turns = [
+            ModelTurn(
+                tool_calls=(
+                    call(
+                        "set_boxes",
+                        {
+                            "boxes": [
+                                {"box_2d": [1, 1, 4, 4], "label": "rock"}
+                            ]
+                        },
+                    ),
+                )
+            ),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(turns, Path(tmp))
+            self.assertEqual(result.frames, 0)
+            self.assertEqual(loop.box_overlay, [])
+            record = json.loads(
+                (result.run_dir / "actions.jsonl").read_text().splitlines()[0]
+            )
+            self.assertEqual(record["error"], "invalid_arguments")
+            self.assertIn("view_board", record["message"])
+
+    def test_strict_box_labels_reject_unknown(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(
+                tool_calls=(
+                    call(
+                        "set_boxes",
+                        {
+                            "boxes": [
+                                {"box_2d": [1, 1, 4, 4], "label": "unknown"}
+                            ]
+                        },
+                    ),
+                )
+            ),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(
+                turns, Path(tmp), strict_box_labels=True
+            )
+            self.assertEqual(loop.box_overlay, [])
+            record = json.loads(
+                (result.run_dir / "actions.jsonl").read_text().splitlines()[1]
+            )
+            self.assertEqual(record["error"], "invalid_arguments")
+            self.assertIn("must be one of", record["message"])
 
     def test_extra_tool_calls_are_rejected(self) -> None:
         turns = [
@@ -285,6 +487,37 @@ class LoopTests(unittest.TestCase):
             self.assertEqual(system["role"], "system")
             self.assertIn("Old fact: the spikes are deadly.", system["content"])
             self.assertIn("Persistent notes from previous runs", system["content"])
+
+    def test_guidance_is_added_to_next_prompt(self) -> None:
+        turns = [ModelTurn(content="done")]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(
+                turns,
+                Path(tmp),
+                guidance=["go left toward the rock", "avoid the spikes"],
+            )
+            user_messages = [
+                message["content"]
+                for message in loop.messages
+                if message.get("role") == "user"
+            ]
+            combined = "\n".join(user_messages)
+            self.assertIn("go left toward the rock", combined)
+            self.assertIn("avoid the spikes", combined)
+            self.assertEqual(loop.pending_guidance, 0)
+            guidance_records = [
+                json.loads(line)
+                for line in (
+                    result.run_dir / "guidance.jsonl"
+                ).read_text().splitlines()
+            ]
+            self.assertEqual(
+                [record["text"] for record in guidance_records],
+                ["go left toward the rock", "avoid the spikes"],
+            )
+            self.assertTrue(
+                all(record["step"] == 1 for record in guidance_records)
+            )
 
     def test_mistral_adapter_does_not_force_tools_when_none(self) -> None:
         client = FakeMistralClient(content="hello")

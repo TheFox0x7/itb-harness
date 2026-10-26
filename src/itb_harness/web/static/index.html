@@ -29,6 +29,20 @@
     <span id="live-error" class="live-error"></span>
   </div>
 
+  <form id="live-steer-form" class="live-steer" hidden>
+    <label for="live-steer-input">steer</label>
+    <input
+      id="live-steer-input"
+      type="text"
+      maxlength="2000"
+      autocomplete="off"
+      placeholder="Guide or correct the model before its next turn…"
+    >
+    <button type="submit">Send</button>
+    <span id="live-steer-status" class="live-steer-status"></span>
+  </form>
+  <div id="live-guidance" class="live-guidance" hidden></div>
+
   <main class="layout">
     <section class="viewer">
       <div class="frame-toolbar">

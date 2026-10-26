@@ -1,8 +1,8 @@
 # itb-harness
 
-Prototype LLM game harness. The first milestone is the **observe loop**: pick a
-game window once per session, capture its client area, and write PNG frames plus
-metadata for a model to consume.
+Prototype LLM game harness for **Helltaker**. Pick the game window once per
+session, capture its client area, and let the model observe screenshots and
+move with arrow-key tools.
 
 ## Current backends
 
@@ -30,13 +30,13 @@ Run the game in gamescope, then point the harness at gamescope's nested
 Xwayland display:
 
 ```bash
-gamescope -W 1920 -H 1080 -w 1920 -h 1080 -- ./Breach
+gamescope -W 1920 -H 1080 -w 1920 -h 1080 -- ./Helltaker
 
 # Find the game's nested display and auth file:
 tr '\0' '\n' < /proc/<game-pid>/environ | grep -E '^(DISPLAY|XAUTHORITY)='
 
 DISPLAY=:2 XAUTHORITY=/run/user/1000/xauth_... \
-  uv run itb-harness --backend x11 --window Breach
+  uv run itb-harness --backend x11 --window Helltaker
 ```
 
 The `x11` backend connects to that nested server directly. Input tools should
@@ -56,7 +56,7 @@ Useful commands inside the REPL:
 ```text
 windows                 list windows
 target 3                select by index
-target Breach           select by title/app-id substring
+target Helltaker           select by title/app-id substring
 observe                 capture one frame
 auto 10 0.5             capture 10 frames, 0.5 s apart
 status                  show target and output directory
@@ -67,7 +67,7 @@ Non-interactive shortcuts:
 
 ```bash
 uv run itb-harness --list
-uv run itb-harness --window Breach --once --out runs
+uv run itb-harness --window Helltaker --once --out runs
 ```
 
 Output:
@@ -98,7 +98,7 @@ The viewer reads `run.json`, `conversation.jsonl`, `actions.jsonl`, and
 - per-turn thinking, model text, usage, and tool calls
 - frame thumbnails and previous/next navigation
 - the latest screenshot by default
-- click/hover markers drawn from `click`/`hover`/`inspect` points
+- markers for older click/hover/inspect runs
 - live coordinate readout and crosshair while hovering the image
 - optional normalized `0–1000` coordinate readout/copy mode
 - click the image to copy the current coordinates to the clipboard
@@ -117,7 +117,7 @@ Start a live session with the browser UI:
 ```bash
 DISPLAY=:2 XAUTHORITY=/run/user/1000/xauth_... \
   uv run itb-agent \
-    --backend x11 --window Breach --input x11 \
+    --backend x11 --window Helltaker --input x11 \
     --web --port 8000
 ```
 
@@ -131,14 +131,22 @@ Controls:
 - **Pause** — finish the current step, then pause
 - **Stop** — stop after the current step (an in-flight model request may finish)
 - **follow** — keep the browser on the live run and latest frame
+- **steer** — queue a guidance message for the model's next turn
 
 There is no predetermined step count in web mode; `--steps` is ignored.
+
+Steering is cooperative: the message is added to the model conversation at
+the start of the next turn, not sent as an immediate key press. If the session
+is paused, press **Step** or **Resume** after queueing guidance. The live bar
+shows how many guidance messages are pending, and the guidance history shows
+when a message is queued and when it is sent to the model.
 
 The live UI uses an SSE stream at `/api/live/events` for:
 
 - `thinking` and `content` deltas
 - phase/status changes
 - tool results and frame notifications
+- queued/sent steering guidance
 - first-token latency and last-activity age
 
 The thinking panel streams live, and the status line shows phases such as
@@ -152,6 +160,8 @@ The timeline opens at the latest turn and preserves its scroll position and
 expanded thinking blocks across live refreshes. If you are at the bottom, it
 follows new turns; otherwise it stays where you were reading. Thinking text is
 loaded into the DOM only when its block is expanded, so long runs stay light.
+Steering interjections are shown in the timeline and recorded in
+`guidance.jsonl`.
 
 Harness console output is suppressed in web mode. Token-level thinking is
 streamed only in the browser in web mode, and in the terminal in headless mode.
@@ -163,113 +173,78 @@ The live server also serves the replay UI for all runs under `--out` (default
 
 ## Agent loop
 
-The observer/act loop lives in `src/itb_harness/loop.py` and runs as
+The observation/movement loop lives in `src/itb_harness/loop.py` and runs as
 `itb-agent`.
 
-The model is not given an automatic screenshot. It has the following tools,
-plus an optional persistent-note tool:
+The model is not given an automatic screenshot. It has exactly these tools:
 
 | Tool | Args | Effect |
 |---|---|---|
 | `view_board` | — | Capture and return the current game screenshot |
-| `click` | `point_2d` pixels or normalized | Move, left-click, and return a screenshot marked at the click; hover first to preview |
-| `hover` | `point_2d` pixels or normalized | Hover and capture a plain screenshot without details |
-| `inspect` | `point_2d` pixels or normalized | Hover while holding Left Ctrl and capture detailed tooltips |
-| `attack_order` | — | Hold Left Alt and capture the attack-order preview; hover individual targets before committing |
-| `repair` | — | Press `R`; hover the selected mech to preview, then click it as the repair target |
-| `weapon` | `number` 1 or 2 | Press that number; hover the target to preview, then click it |
-| `select_unit` | `number` 1-5 | Press A/S/D/Z/X for units 1-5; hover the selected unit to inspect it |
-| `end_turn` | — | Press Space |
-| `undo_move` | — | Press Left Shift; only moves can be undone, attacks are permanent |
-| `reset_turn` | — | Press Backspace; once per mission and not always available |
-| `cancel` | — | Right-click |
-| `note` | `text` | Append a note for future runs (only with `--notes`) |
+| `move_up` | — | Press Up and move one tile |
+| `move_down` | — | Press Down and move one tile |
+| `move_left` | — | Press Left and move one tile |
+| `move_right` | — | Press Right and move one tile |
+| `reset_level` | — | Press `R` to restart the current level and clear the box overlay |
+| `set_boxes` | `boxes` list | Replace the persistent bounding-box overlay on screenshots |
+| `add_boxes` | `boxes` list | Append boxes to the persistent overlay without clearing it |
 
-Before the mission, the model may need to navigate the squad selection screen:
-click the center of the top-right **Start** button, wait for the Difficulty
-Setup dialog, choose a difficulty, then click the dialog's bottom-right
-**Start** button. These are UI buttons, not board tiles; the grid overlay is
-not drawn on those screens.
+Each movement tool captures a fresh screenshot after moving and returns it to
+the model.
 
-Coordinates default to `[x, y]` in screenshot pixels, origin top-left; the
-valid range is `0..width-1` by `0..height-1`. `view_board` reports the
-screenshot dimensions. Pass `--normalize-coordinates` to switch
-click/hover/inspect points to normalized `0..1000` values instead; use
-`--no-normalize-coordinates` to return to pixels. `repair`, `weapon`, and
-`select_unit` operate on the current UI selection; select mechs and weapons
-with clicks or the unit keys.
+`set_boxes` takes a list of objects:
 
-`click`, `hover`, `inspect`, and `attack_order` return screenshots. `click`
-annotates the returned frame at the clicked pixel. `repair`, `weapon`, `select_unit`,
-`end_turn`, `undo_move`, `reset_turn`, and `cancel` return text only; call
-`view_board` when you need to see the result.
+```json
+{"boxes": [{"box_2d": [xmin, ymin, xmax, ymax], "label": "rock"}]}
+```
 
-The model is instructed to call `view_board` first and to call it again after
-an action when it needs to see the result. `hover` is for plain previews;
-`inspect` holds Left Ctrl for detailed tooltips and predicted attack results.
+Coordinates are screenshot pixels by default. Pass `--scaled-boxes` to use
+scaled coordinates from 1 to 1000 instead, where 1 is the top/left edge and
+1000 is the bottom/right edge.
+
+The boxes are drawn on the current screenshot and every screenshot after it.
+A later `set_boxes` call replaces the overlay completely; an empty list clears
+it. `add_boxes` appends to the current overlay instead. `reset_level` also
+clears the overlay. Known labels get category colors (`spike trap`,
+`skeleton`, `rock`, `demon`, `helltaker`).
+
+Use `--strict-box-labels` to restrict labels to those five categories and
+enable the strict tool schema. Without the flag, arbitrary labels are allowed.
+
+The model is instructed to call `view_board` first, plan the whole level
+before moving, and call it again after movement when it needs to re-orient
+itself. The counter on the left is the step counter; `reset_level` restarts the
+level with `R` when a plan fails.
 
 ```bash
 export MISTRAL_API_KEY=...
 export MISTRAL_MODEL=mistral-large-4   # optional
 
 DISPLAY=:2 XAUTHORITY=/run/user/1000/xauth_... \
-  uv run itb-agent --backend x11 --window Breach --steps 10 --input x11
+  uv run itb-agent --backend x11 --window Helltaker --steps 30 --input x11
 ```
 
-`--input stub` (the default) records clicks/hovers without touching the pointer.
-If clicks appear to do nothing, check for the startup warning or the `input`
-field in `run.json`; a `stub` run is a dry run, not a real game session.
-`--input x11` performs real XTest input on `DISPLAY`; use it with the gamescope
-nested display. `--action-delay` waits after clicks, keys, and hover actions
-(default `0.5`); increase it to `0.6` or more if menu/dialog transitions are
-not finished before the next screenshot. `--max-images` controls how many tool
-screenshots stay in history (`0` keeps everything).
-`--normalize-coordinates` selects normalized 0..1000 points for
-click/hover/inspect; the default is screenshot pixels.
+`--input stub` (the default) records key presses without sending them. Use
+`--input x11` for real XTest input on `DISPLAY`.
 
-`--snap-to-tile` snaps click/hover/inspect coordinates to the nearest board tile
-centre. The isometric grid is calibrated at runtime from the tan drop-zone
-tiles during deployment (colour masking + connected components), then reused
-for the rest of the game. Clicks farther than 60 px from any tile centre are
-left unchanged (assumed to target UI elements). The snap is logged in the
-action record and mentioned in the tool result message.
+`--action-delay` waits after a move before capturing (default `0.5`). Increase
+it if the game’s movement animation is not finished before the next screenshot.
 
-`--grid-overlay` draws the isometric tile grid on board screenshots: diamond
-outlines for all 64 tiles, centre markers, and pixel-coordinate labels
-(e.g. `472,288`) at each tile centre. During deployment, valid drop-zone
-tiles are highlighted with a gold tint. The overlay makes it easy for the
-model to read off exact click coordinates instead of estimating them. It is
-only applied after the grid has been calibrated from the board, so start
-menus, squad selection, and dialogs stay clean.
-Implies grid calibration.
+`--max-images` controls how many tool screenshots stay in conversation history
+(`0` keeps everything).
 
-Combine both flags for the best results:
-
-```bash
-uv run itb-agent --backend x11 --window Breach --input x11 \
-  --snap-to-tile --grid-overlay --steps 30
-```
-
-Action logs always include the resolved `pixel` coordinate, so replay/live
-markers work in either coordinate mode even when the model’s arguments are
-normalized.
-
-Enable persistent notes with:
-
-```bash
-uv run itb-agent ... --notes --notes-file notes.md
-```
-
-Existing notes are loaded into the system prompt at startup; the optional
-`note` tool appends new entries for future runs. Notes are not injected
-mid-run, which keeps the prompt prefix stable. `--notes-max-chars` limits how
-much of a long notes file is loaded.
+`--strict-box-labels` restricts `set_boxes`/`add_boxes` labels to the known
+categories: `spike trap`, `skeleton`, `rock`, `demon`, and `helltaker`. Boxes
+are colored by category either way; the flag controls validation and the tool
+schema. `--scaled-boxes` switches box coordinates from screenshot pixels to
+scaled 1..1000 values. The timeline prints the box arguments, including
+invalid calls, rather than only showing a box count.
 
 Each iteration:
 
 1. send the tool schemas and conversation to the model
 2. execute the single tool call it returns
-3. append the tool result (text or image)
+3. append the tool result, including a screenshot for movement and `view_board`
 4. repeat until `--steps` or the model returns no tool call
 
 Thinking is streamed live by default (`--no-stream` disables it). It is also
@@ -281,10 +256,11 @@ Output:
 ```text
 runs/<timestamp>-agent/
   run.json              backend, input, model, cache key, limits
-  frames/0001.png       screenshots returned by view_board/hover/inspect
+  frames/0001.png       screenshots returned by view_board and movement tools
   thinking/0001.txt     model reasoning/thinking chunks, if provided
   actions.jsonl         tool name, args, result, frame links
   conversation.jsonl    model content, thinking, usage, tool calls
+  guidance.jsonl        user steering messages, by turn
 ```
 
 Old tool-message screenshots are pruned from the conversation by default
@@ -292,54 +268,4 @@ Old tool-message screenshots are pruned from the conversation by default
 prompt prefix and invalidates cache entries from that point onward; use
 `--max-images 0` for append-only history and better prompt-cache reuse.
 
-Notes live in a separate Markdown file (`notes.md` by default), outside the run
-directory, so they persist across runs and are easy to review.
-
-`Ctrl-C` stops the loop after the current tool call; a fully interruptible,
-open-ended run can replace the `--steps` cap later without changing the tool
-protocol.
-
-### Prompt caching
-
-The agent sends a stable `prompt_cache_key` on every request (per-run UUID,
-`--cache-key`, or `MISTRAL_PROMPT_CACHE_KEY`). Responses report cached prompt
-tokens in `usage`, which are logged and shown as:
-
-```text
-  cache: 64/1024 prompt tokens
-```
-
-Mistral caching is prefix-based and best-effort.
-
-## Legacy tool schemas (not used)
-
-`src/itb_harness/tools.py` still contains the earlier semantic action tools
-(`move_mech`, `end_turn`, etc.) and `ToolResult`, but the loop does not send
-those schemas. The active board tools are defined in
-`src/itb_harness/board_tools.py`.
-
-## Cross-platform note
-
-There is no single reliable Python API for **window** capture across Wayland,
-macOS, and Windows. Screen capture is easy (`XGetImage`, `PrintWindow`,
-ScreenCaptureKit) but window enumeration and native Wayland capture are not.
-The design here is a small `CaptureBackend` protocol:
-
-- `list_monitors()`
-- `list_windows()`
-- `capture_window(id) -> Frame`
-
-Current implementations:
-
-- KWin (KDE Wayland)
-- Generic X11 via `python-xlib` (Xorg, XWayland, Xvfb, gamescope)
-
-Future backends can be added without changing the REPL/agent loop:
-
-- Linux Wayland (portable): xdg-desktop-portal ScreenCast (PipeWire).
-- Windows: Windows Graphics Capture or `PrintWindow`.
-- macOS: ScreenCaptureKit / `screencapture -l`.
-
-Note: `mss` is not used. It only captures X root regions; the nested gamescope
-Xwayland root is black, so the X11 backend uses `XGetImage` on the game window
-instead.
+`Ctrl-C` stops the loop after the current tool call.

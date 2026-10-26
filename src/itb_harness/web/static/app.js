@@ -46,13 +46,43 @@ function frameURL(name) {
   return `/api/runs/${encodeURIComponent(state.run.id)}/frames/${encodeURIComponent(name)}`;
 }
 
-function formatArgs(args) {
+function normalizeArgs(args) {
+  if (typeof args !== "string") return args;
+  try {
+    return JSON.parse(args);
+  } catch (error) {
+    return args;
+  }
+}
+
+function formatBoxes(boxes) {
+  if (!Array.isArray(boxes)) {
+    return `boxes: ${JSON.stringify(boxes)}`;
+  }
+  if (!boxes.length) return "0 boxes";
+  return boxes
+    .map((box) => {
+      if (!box || typeof box !== "object") return String(box);
+      const coords = Array.isArray(box.box_2d)
+        ? `[${box.box_2d.join(", ")}]`
+        : "[?]";
+      const label =
+        typeof box.label === "string" ? box.label : "?";
+      return `${label} ${coords}`;
+    })
+    .join("; ");
+}
+
+function formatArgs(rawArgs) {
+  const args = normalizeArgs(rawArgs);
+  if (typeof args === "string") return args;
   if (!args || typeof args !== "object") return "";
   const point = args.point_2d;
   if (Array.isArray(point) && point.length === 2) {
     const suffix = args.with_details ? " +details" : "";
     return `(${point[0]}, ${point[1]})${suffix}`;
   }
+  if ("boxes" in args) return formatBoxes(args.boxes);
   if (typeof args.steps !== "undefined") return `×${args.steps}`;
   if (typeof args.number !== "undefined") return `#${args.number}`;
   if (typeof args.text === "string") {
@@ -145,6 +175,15 @@ function renderTimeline(options = {}) {
     if (usage) head.append(el("span", "usage", usage));
     box.append(head);
 
+    if (turn.guidance?.length) {
+      const guidance = el("div", "guidance");
+      guidance.append(el("div", "guidance-title", "interjection"));
+      for (const text of turn.guidance) {
+        guidance.append(el("div", "guidance-line", text));
+      }
+      box.append(guidance);
+    }
+
     if (turn.thinking) {
       const details = el("details", "thinking");
       const ensureThinking = () => {
@@ -187,7 +226,19 @@ function renderTimeline(options = {}) {
         const line = el("div", "action-line");
         line.append(el("span", `tool ${action.tool}`, action.tool));
         const args = formatArgs(action.arguments);
-        if (args) line.append(el("span", "action-args", args));
+        if (args) {
+          const argsNode = el("span", "action-args", args);
+          argsNode.title = args;
+          const normalized = normalizeArgs(action.arguments);
+          if (
+            normalized &&
+            typeof normalized === "object" &&
+            "boxes" in normalized
+          ) {
+            argsNode.classList.add("boxes");
+          }
+          line.append(argsNode);
+        }
         if (!action.ok) line.append(el("span", "badge", action.error || "error"));
         if (target) line.append(el("span", "frame-ref", target));
         button.append(line);
@@ -499,6 +550,7 @@ function timelineSignature(run) {
         (turn.thinking ?? "").length,
         (turn.content ?? "").length,
         actions.length,
+        (turn.guidance ?? []).join("\u0001"),
         last?.tool ?? "",
         last?.ok ? 1 : 0,
         (last?.message ?? "").length,
@@ -562,13 +614,22 @@ function liveSignature(live) {
 function updateLiveControls(live) {
   const panel = $("#live-panel");
   const stream = $("#live-stream");
+  const steerForm = $("#live-steer-form");
+  const steerInput = $("#live-steer-input");
+  const guidance = $("#live-guidance");
   if (!live?.active) {
     panel.hidden = true;
     stream.hidden = true;
+    steerForm.hidden = true;
+    guidance.hidden = true;
     return;
   }
   panel.hidden = false;
   stream.hidden = false;
+  const terminal = ["stopped", "stopping", "error"].includes(live.state);
+  steerForm.hidden = terminal;
+  steerInput.disabled = terminal;
+  if (terminal) guidance.hidden = true;
   const label = live.busy ? `${live.state} (working)` : live.state;
   $("#live-state").textContent = label;
   const input = live.input ?? "unknown";
@@ -583,6 +644,10 @@ function updateLiveControls(live) {
       : "";
 
   const stateName = live.state;
+  const pending = live.pending_guidance ?? 0;
+  $("#live-steer-status").textContent = pending
+    ? `${pending} queued`
+    : "";
   $("#live-step").disabled = stateName !== "paused";
   $("#live-resume").disabled = stateName !== "paused";
   $("#live-pause").disabled = stateName !== "running";
@@ -654,6 +719,20 @@ function liveIsTerminal(live) {
   return ["stopped", "stopping", "error"].includes(live?.state);
 }
 
+function appendGuidance(text, sent = false) {
+  const box = $("#live-guidance");
+  if (!text) return;
+  box.hidden = false;
+  const line = el(
+    "div",
+    `live-guidance-line${sent ? " sent" : ""}`,
+    text
+  );
+  box.append(line);
+  while (box.children.length > 30) box.firstChild.remove();
+  box.scrollTop = box.scrollHeight;
+}
+
 function handleLiveEvent(event) {
   state.liveActivityAt = Date.now();
   state.liveActivityAgeMs = 0;
@@ -711,6 +790,19 @@ function handleLiveEvent(event) {
   }
 
   if (["frame", "turn", "tool_result"].includes(type)) {
+    requestLiveRunRefresh();
+    return;
+  }
+
+  if (type === "guidance_queued") {
+    appendGuidance(`queued: ${event.text ?? ""}`);
+    $("#live-steer-status").textContent = "queued";
+    return;
+  }
+
+  if (type === "guidance") {
+    appendGuidance(`sent: ${event.text ?? ""}`, true);
+    $("#live-steer-status").textContent = "";
     requestLiveRunRefresh();
     return;
   }
@@ -901,6 +993,30 @@ $("#follow-live").addEventListener("change", (event) => {
     loadRun(state.live.run_id).catch((error) => {
       $("#live-error").textContent = `could not follow live run: ${error}`;
     });
+  }
+});
+
+$("#live-steer-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = $("#live-steer-input");
+  const status = $("#live-steer-status");
+  const text = input.value.trim();
+  if (!text) return;
+  status.textContent = "sending…";
+  try {
+    const response = await fetch("/api/live/steer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) {
+      throw new Error(data.detail || "steering unavailable");
+    }
+    input.value = "";
+    status.textContent = "queued";
+  } catch (error) {
+    status.textContent = `failed: ${error}`;
   }
 });
 

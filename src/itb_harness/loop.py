@@ -1,7 +1,7 @@
 """Main observation and movement loop for Helltaker.
 
-The model sees screenshots and can move one or more tiles at a time with the
-four arrow-key movement tools.
+The model sees screenshots and can move one tile at a time with the four
+arrow-key movement tools.
 """
 
 from __future__ import annotations
@@ -11,14 +11,17 @@ import base64
 import json
 import sys
 import textwrap
+import threading
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from .agent import ChatAgent, MistralAgent, ModelToolCall, ModelTurn
-from .board_tools import parse_move_args, tool_schemas
+from .annotate import BoxAnnotation, annotate_boxes
+from .board_tools import parse_boxes_args, tool_schemas
 from .capture import (
     BackendUnavailable,
     CaptureBackend,
@@ -34,7 +37,13 @@ from .notes import NotesStore
 from .tools import ToolResult
 
 
-INPUT_TOOLS = {"move_up", "move_down", "move_left", "move_right"}
+INPUT_TOOLS = {
+    "move_up",
+    "move_down",
+    "move_left",
+    "move_right",
+    "reset_level",
+}
 MOVE_KEYS = {
     "move_up": "up",
     "move_down": "down",
@@ -48,25 +57,71 @@ You are controlling Helltaker, a grid-based puzzle game.
 You do not receive screenshots automatically. Use view_board to capture the
 current game screen.
 
-Movement tools:
+Tools:
 - move_up: press the Up arrow.
 - move_down: press the Down arrow.
 - move_left: press the Left arrow.
 - move_right: press the Right arrow.
+- reset_level: press R to restart the current level and clear the
+  bounding-box overlay.
+- set_boxes: replace the persistent bounding-box overlay on screenshots.
+  Pass `boxes` as a list of `{"box_2d": [xmin, ymin, xmax, ymax],
+  "label": string}` objects. Coordinates are screenshot pixels. The overlay
+  is applied to this screenshot and every future screenshot until the next
+  set_boxes call replaces it completely.
+- add_boxes: append boxes to the existing overlay without clearing the
+  previous boxes. Uses the same `boxes` format as set_boxes.
 
-Each movement tool accepts a `steps` argument. Use steps > 1 to move several
-tiles in one batch instead of making several tool calls. Movement is
-tile-based: one step should move exactly one tile unless blocked by a wall,
-object, or the edge of the room.
+Each movement tool moves exactly one tile. Movement is tile-based: a move
+should advance one tile unless blocked by a wall, object, or the edge of the
+room.
+
+Game rules:
+- Skeleton knights can be kicked by moving into them. If kicked into the level
+  edge, they are destroyed. You may see bones on the screenshot or it might be missing from the next image.
+  They are not a threat to you, but they will delay your movement and make you waste steps.
+- Kicking skeletons does not cascade and there usually is a better way than kicking every single one.
+- Spikes are marked by white or black spots on the floor which alternate between hidden and showing as you move.
+  They aren't in the early levels so you don't need to be cautious of them.
+- Black tiles are edges and cannot be moved into. The map is grid based but it is not regular.
+- Many obstacles are pushable by moving into them.
+- Assume you can only move on the red space. Everything else is blocked. Rocks on the playing field might also be red and impassible
+  but they are distinct from flat ground you can navigate.
+- Moving into the wall or edges is not a valid move and will not consume steps. 
+  However it is wasting your time so it is recommended for you to reexamine if your move consumed steps and if not, change strategy.
+- Pillars are usually either obstacles or decoration. They aren't interactive and you can ignore them.
+- White flashes on black screen means you ran out of steps and lost. Next call to view screen will return level as it was after reset.
+- X on the left counter means you are on your last move. This usually means you're about to lose the game unless your next move brings you in front of the demon.
+
+Do not be hesitant to test things out. You're not timed or graded on the task.
+Your goal is to beat the level given and have fun doing it.
+Trial and error are part of the learning experience and no one expects you to beat the level on your first try,
+however you are encouraged to learn from your attempts on what worked well what did not.
+Pay attention to your previous steps. User can interject and help you on your way.
 
 Call view_board first. After moving, call view_board again when you need to
-see the result or re-orient yourself. Use exactly one tool per turn. Do not
-describe an action in prose; call a tool.
+see the result or re-orient yourself. Do not describe an action in prose; call a tool.
 """
 
 
-def build_system_prompt() -> str:
-    return SYSTEM_PROMPT
+def build_system_prompt(
+    strict_box_labels: bool = False,
+    scaled_boxes: bool = False,
+) -> str:
+    prompt = SYSTEM_PROMPT
+    if scaled_boxes:
+        prompt += (
+            "\nFor set_boxes and add_boxes, box coordinates are scaled from "
+            "1 to 1000, where 1 is the top/left edge and 1000 is the "
+            "bottom/right edge."
+        )
+    if strict_box_labels:
+        prompt += (
+            "\nFor set_boxes and add_boxes, labels must be exactly one of: "
+            "spike trap, skeleton, rock, demon, helltaker. Boxes are colored "
+            "by category."
+        )
+    return prompt
 
 
 @dataclass(slots=True)
@@ -74,7 +129,8 @@ class LoopConfig:
     max_steps: int = 20
     max_images: int = 4
     action_delay: float = 0.5
-    move_delay: float = 0.1
+    strict_box_labels: bool = False
+    scaled_boxes: bool = False
     show_thinking: bool = False
     console: bool = True
     out_dir: Path = field(default_factory=lambda: Path("runs"))
@@ -115,8 +171,10 @@ class Recorder:
 
         self.actions_path = self.root / "actions.jsonl"
         self.conversation_path = self.root / "conversation.jsonl"
+        self.guidance_path = self.root / "guidance.jsonl"
         self._actions = self.actions_path.open("a", encoding="utf-8")
         self._conversation = self.conversation_path.open("a", encoding="utf-8")
+        self._guidance_log = self.guidance_path.open("a", encoding="utf-8")
 
         (self.root / "run.json").write_text(
             json.dumps(
@@ -129,7 +187,8 @@ class Recorder:
                     "max_steps": config.max_steps,
                     "max_images": config.max_images,
                     "action_delay": config.action_delay,
-                    "move_delay": config.move_delay,
+                    "strict_box_labels": config.strict_box_labels,
+                    "scaled_boxes": config.scaled_boxes,
                     "started_at": datetime.now(timezone.utc).isoformat(
                         timespec="seconds"
                     ),
@@ -169,6 +228,11 @@ class Recorder:
         self._conversation.write(json.dumps(record) + "\n")
         self._conversation.flush()
 
+    def log_guidance(self, step: int, text: str) -> None:
+        record = {"step": step, "text": text}
+        self._guidance_log.write(json.dumps(record) + "\n")
+        self._guidance_log.flush()
+
     def log_tool_call(
         self,
         step: int,
@@ -203,6 +267,7 @@ class Recorder:
     def close(self) -> None:
         self._actions.close()
         self._conversation.close()
+        self._guidance_log.close()
 
 
 class ThinkingPrinter:
@@ -262,6 +327,9 @@ class HarnessLoop:
         self.final_text: str | None = None
         self._closed = False
         self.event_callback: Callable[[dict[str, Any]], None] | None = None
+        self.box_overlay: list[BoxAnnotation] = []
+        self._guidance: deque[str] = deque()
+        self._guidance_lock = threading.Lock()
 
         if self.config.console:
             print(f"Target  [{target.monitor or '?'}] {target.label}")
@@ -271,7 +339,10 @@ class HarnessLoop:
                 print(f"Notes   {notes.path} ({notes.char_count} chars loaded)")
             print(f"Output  {self.recorder.root}")
 
-        system_prompt = build_system_prompt()
+        system_prompt = build_system_prompt(
+            self.config.strict_box_labels,
+            self.config.scaled_boxes,
+        )
         if input_backend.name == "stub":
             system_prompt += (
                 "\n\nInput is in stub/dry-run mode: actions are recorded but "
@@ -296,9 +367,34 @@ class HarnessLoop:
         if self.event_callback is not None:
             self.event_callback({"type": event_type, **data})
 
+    def add_guidance(self, text: str) -> bool:
+        """Queue a user steering message for the next model turn."""
+        text = text.strip()
+        if not text:
+            return False
+        with self._guidance_lock:
+            self._guidance.append(text)
+        return True
+
+    def _take_guidance(self) -> list[str]:
+        with self._guidance_lock:
+            items = list(self._guidance)
+            self._guidance.clear()
+        return items
+
+    @property
+    def pending_guidance(self) -> int:
+        with self._guidance_lock:
+            return len(self._guidance)
+
     def _capture(self) -> Frame:
         frame = self.backend.capture_window(self.target.id)
         self.target = frame.window
+        if self.box_overlay:
+            frame = replace(
+                frame,
+                png=annotate_boxes(frame.png, self.box_overlay),
+            )
         self.frame = frame
         path = self.recorder.save_frame(frame)
         self.last_frame_path = path
@@ -363,26 +459,91 @@ class HarnessLoop:
                     self.last_frame_path,
                 )
 
-            key = MOVE_KEYS.get(call.name)
-            if key is not None:
-                steps = parse_move_args(call.arguments)
-                for index in range(steps):
-                    self.input.key(key)
-                    if (
-                        index + 1 < steps
-                        and self.config.move_delay > 0
+            if call.name in {"set_boxes", "add_boxes"}:
+                if self.frame is None:
+                    raise ValueError(
+                        f"Call view_board before {call.name}."
+                    )
+                boxes = parse_boxes_args(
+                    call.arguments,
+                    strict_labels=self.config.strict_box_labels,
+                    scaled_boxes=self.config.scaled_boxes,
+                    width=self.frame.width,
+                    height=self.frame.height,
+                )
+                for box in boxes:
+                    if not (
+                        0 <= box.xmin < box.xmax <= self.frame.width
+                        and 0 <= box.ymin < box.ymax <= self.frame.height
                     ):
-                        time.sleep(self.config.move_delay)
-                self.action_count += steps
+                        raise ValueError(
+                            "Bounding box is outside the screenshot "
+                            f"{self.frame.width}x{self.frame.height}."
+                        )
+                if call.name == "set_boxes":
+                    self.box_overlay = boxes
+                else:
+                    self.box_overlay = [*self.box_overlay, *boxes]
+                self._pause()
+                frame = self._capture()
+                if call.name == "set_boxes":
+                    if boxes:
+                        message = (
+                            f"Overlay set with {len(boxes)} boxes. "
+                            f"Screenshot attached "
+                            f"({frame.width}x{frame.height})."
+                        )
+                    else:
+                        message = (
+                            "Overlay cleared. Screenshot attached "
+                            f"({frame.width}x{frame.height})."
+                        )
+                else:
+                    message = (
+                        f"Added {len(boxes)} boxes; overlay now has "
+                        f"{len(self.box_overlay)}. Screenshot attached "
+                        f"({frame.width}x{frame.height})."
+                    )
+                return (
+                    ToolResult(
+                        ok=True,
+                        message=message,
+                        image_png=frame.png,
+                    ),
+                    self.last_frame_path,
+                )
+
+            if call.name == "reset_level":
+                self.input.key("r")
+                self.box_overlay = []
+                self.action_count += 1
                 self._pause()
                 frame = self._capture()
                 return (
                     ToolResult(
                         ok=True,
                         message=(
-                            f"Moved {key} {steps} "
-                            f"{'step' if steps == 1 else 'steps'}. "
+                            "Level reset with R; bounding-box overlay cleared. "
                             f"Screenshot attached "
+                            f"({frame.width}x{frame.height})."
+                        ),
+                        image_png=frame.png,
+                        state_changed=True,
+                    ),
+                    self.last_frame_path,
+                )
+
+            key = MOVE_KEYS.get(call.name)
+            if key is not None:
+                self.input.key(key)
+                self.action_count += 1
+                self._pause()
+                frame = self._capture()
+                return (
+                    ToolResult(
+                        ok=True,
+                        message=(
+                            f"Moved {key} one tile. Screenshot attached "
                             f"({frame.width}x{frame.height})."
                         ),
                         image_png=frame.png,
@@ -426,6 +587,20 @@ class HarnessLoop:
 
         self.step_index += 1
         step = self.step_index
+        guidance = self._take_guidance()
+        if guidance:
+            text = "\n".join(f"- {item}" for item in guidance)
+            for item in guidance:
+                self.recorder.log_guidance(step, item)
+            self.messages.append(
+                {
+                    "role": "user",
+                    "content": "User guidance for this turn:\n" + text,
+                }
+            )
+            self._emit("guidance", text=text, step=step)
+            if self.config.console:
+                print(f"  guidance: {text}")
         if self.config.console:
             print(f"\n[turn {step}]")
         self._emit("status", phase="model_waiting", step=step)
@@ -441,7 +616,10 @@ class HarnessLoop:
         try:
             turn = self.agent.complete(
                 self.messages,
-                tools=tool_schemas(),
+                tools=tool_schemas(
+                    strict_labels=self.config.strict_box_labels,
+                    scaled_boxes=self.config.scaled_boxes,
+                ),
                 on_thinking=on_thinking,
                 on_content=on_content,
             )
@@ -670,17 +848,25 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.5,
         help=(
-            "Seconds to wait after a movement batch before capturing "
-            "(default: 0.5)."
+            "Seconds to wait after a move before capturing (default: 0.5)."
         ),
     )
     parser.add_argument(
-        "--move-delay",
-        type=float,
-        default=0.1,
+        "--strict-box-labels",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help=(
-            "Seconds between individual key presses in a movement batch "
-            "(default: 0.1)."
+            "Restrict set_boxes labels to the known Helltaker categories "
+            "and color boxes by category (default: off)."
+        ),
+    )
+    parser.add_argument(
+        "--scaled-boxes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use scaled 1..1000 coordinates for set_boxes/add_boxes instead "
+            "of screenshot pixels (default: pixels)."
         ),
     )
     parser.add_argument(
@@ -801,7 +987,8 @@ def main(argv: list[str] | None = None) -> int:
             max_steps=max(1, args.steps),
             max_images=args.max_images,
             action_delay=max(0.0, args.action_delay),
-            move_delay=max(0.0, args.move_delay),
+            strict_box_labels=args.strict_box_labels,
+            scaled_boxes=args.scaled_boxes,
             show_thinking=args.show_thinking,
             console=not args.web,
             out_dir=args.out.expanduser(),

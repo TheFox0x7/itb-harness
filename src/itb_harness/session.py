@@ -24,6 +24,8 @@ class SteppableLoop(Protocol):
 
     def step_once(self) -> bool: ...
 
+    def add_guidance(self, text: str) -> bool: ...
+
     def close(self) -> None: ...
 
 
@@ -107,6 +109,20 @@ class SessionRunner:
         self._emit_status()
         return True
 
+    def steer(self, text: str) -> bool:
+        """Queue a steering message for the next model turn."""
+        text = text.strip()
+        if not text:
+            return False
+        with self._lock:
+            if self.state in {"stopped", "stopping", "error"}:
+                return False
+        add_guidance = getattr(self.loop, "add_guidance", None)
+        if not callable(add_guidance) or not add_guidance(text):
+            return False
+        self._broadcast({"type": "guidance_queued", "text": text})
+        return True
+
     def stop(self) -> bool:
         with self._cv:
             if self.state in {"stopped", "stopping"}:
@@ -139,6 +155,9 @@ class SessionRunner:
                 "input": getattr(getattr(self.loop, "input", None), "name", None),
                 "last_activity_age_ms": age_ms,
                 "first_token_ms": self.first_token_ms,
+                "pending_guidance": getattr(
+                    self.loop, "pending_guidance", 0
+                ),
                 "thinking": self.thinking,
                 "content": self.content,
                 "error": self.error,

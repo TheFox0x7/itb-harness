@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from io import BytesIO
 from typing import TYPE_CHECKING
 
@@ -9,6 +10,90 @@ from PIL import Image, ImageDraw, ImageFont
 
 if TYPE_CHECKING:
     from .grid import IsoGrid
+
+
+
+
+BOX_LABEL_COLORS: dict[str, tuple[int, int, int]] = {
+    "spike trap": (255, 90, 70),
+    "skeleton": (235, 235, 235),
+    "rock": (190, 150, 100),
+    "demon": (200, 90, 255),
+    "helltaker": (70, 220, 255),
+}
+_BOX_DEFAULT_COLOR = (255, 210, 80)
+
+
+@dataclass(frozen=True, slots=True)
+class BoxAnnotation:
+    xmin: int
+    ymin: int
+    xmax: int
+    ymax: int
+    label: str
+
+
+def annotate_boxes(png: bytes, boxes: list[BoxAnnotation]) -> bytes:
+    """Draw persistent bounding-box annotations on a screenshot."""
+
+    image = Image.open(BytesIO(png)).convert("RGB")
+    width, height = image.size
+    if not boxes:
+        return png
+
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    scale = max(0.5, min(width / 1280.0, height / 720.0))
+    line_width = max(2, int(round(3 * scale)))
+
+    clamped = []
+    for box in boxes:
+        xmin = max(0, min(width - 1, box.xmin))
+        ymin = max(0, min(height - 1, box.ymin))
+        xmax = max(0, min(width - 1, box.xmax))
+        ymax = max(0, min(height - 1, box.ymax))
+        if xmax <= xmin or ymax <= ymin:
+            continue
+        color = BOX_LABEL_COLORS.get(
+            box.label.strip().lower(), _BOX_DEFAULT_COLOR
+        )
+        draw.rectangle(
+            [xmin, ymin, xmax, ymax],
+            fill=(*color, 35),
+            outline=(*color, 230),
+            width=line_width,
+        )
+        clamped.append((xmin, ymin, xmax, ymax, box.label, color))
+
+    image = Image.alpha_composite(image.convert("RGBA"), overlay)
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    for xmin, ymin, _xmax, _ymax, label, color in clamped:
+        text = label.strip() or "box"
+        bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        label_x = max(2, xmin)
+        label_y = max(2, ymin - text_height - 6)
+        draw.rectangle(
+            [
+                label_x - 3,
+                label_y - 2,
+                label_x + text_width + 3,
+                label_y + text_height + 2,
+            ],
+            fill=(10, 10, 10),
+        )
+        draw.text(
+            (label_x, label_y),
+            text,
+            fill=(*color, 255),
+            font=font,
+        )
+
+    out = BytesIO()
+    image.convert("RGB").save(out, format="PNG", compress_level=1)
+    return out.getvalue()
 
 
 def annotate_click(png: bytes, x: int, y: int, label: str = "click") -> bytes:

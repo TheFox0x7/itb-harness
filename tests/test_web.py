@@ -67,6 +67,9 @@ class ReplayLoaderTests(unittest.TestCase):
         (run / "actions.jsonl").write_text(
             "\n".join(json.dumps(action) for action in actions) + "\n"
         )
+        (run / "guidance.jsonl").write_text(
+            json.dumps({"step": 2, "text": "push the rock left"}) + "\n"
+        )
         return run
 
     def test_load_run_builds_timeline_and_markers(self) -> None:
@@ -87,6 +90,9 @@ class ReplayLoaderTests(unittest.TestCase):
                 inspect["marker_frames"], ["0001.png", "0002.png"]
             )
             self.assertTrue(inspect["with_details"])
+            self.assertEqual(
+                loaded["turns"][1]["guidance"], ["push the rock left"]
+            )
 
     def test_hover_action_has_markers_without_details(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

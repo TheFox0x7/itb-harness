@@ -18,11 +18,16 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 
 _STATIC_DIR = Path(__file__).parent / "static"
 _FRAME_RE = re.compile(r"^[A-Za-z0-9_.-]+\.png$")
 _RUN_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+class SteerRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -96,7 +101,9 @@ def _action_from_record(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_turns(
-    conversation: list[dict[str, Any]], actions: list[dict[str, Any]]
+    conversation: list[dict[str, Any]],
+    actions: list[dict[str, Any]],
+    guidance: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     conversations: dict[int, dict[str, Any]] = {}
     for record in conversation:
@@ -111,7 +118,19 @@ def _build_turns(
         action = _action_from_record(record)
         actions_by_step[action["step"]].append(action)
 
-    steps = sorted(set(conversations) | set(actions_by_step))
+    guidance_by_step: dict[int, list[str]] = defaultdict(list)
+    for record in guidance or []:
+        try:
+            step = int(record.get("step", 0))
+        except (TypeError, ValueError):
+            continue
+        text = record.get("text")
+        if isinstance(text, str) and text.strip():
+            guidance_by_step[step].append(text)
+
+    steps = sorted(
+        set(conversations) | set(actions_by_step) | set(guidance_by_step)
+    )
     turns = []
     for step in steps:
         record = conversations.get(step, {})
@@ -121,6 +140,7 @@ def _build_turns(
                 "content": record.get("content"),
                 "thinking": record.get("thinking"),
                 "usage": record.get("usage"),
+                "guidance": guidance_by_step.get(step, []),
                 "actions": actions_by_step.get(step, []),
             }
         )
@@ -140,12 +160,13 @@ def load_run(run_dir: Path) -> dict[str, Any]:
 
     conversation = _read_jsonl(run_dir / "conversation.jsonl")
     actions = _read_jsonl(run_dir / "actions.jsonl")
+    guidance = _read_jsonl(run_dir / "guidance.jsonl")
 
     return {
         "id": run_dir.name,
         "metadata": metadata,
         "frames": frames,
-        "turns": _build_turns(conversation, actions),
+        "turns": _build_turns(conversation, actions, guidance),
     }
 
 
@@ -231,6 +252,12 @@ def create_app(runs_dir: Path, live: Any | None = None) -> FastAPI:
         session = _require_live()
         session.stop()
         return session.snapshot()
+
+    @app.post("/api/live/steer")
+    def api_live_steer(payload: SteerRequest) -> dict[str, Any]:
+        session = _require_live()
+        ok = session.steer(payload.text)
+        return {"ok": ok, **session.snapshot()}
 
     @app.get("/api/live/events")
     async def api_live_events(
