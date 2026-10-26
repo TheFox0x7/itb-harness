@@ -16,6 +16,7 @@ class ToolResult:
     image_png: bytes | None = None
     state_changed: bool = False
     pixel: tuple[int, int] | None = None
+    blocked: bool | None = None
 
     def payload(self) -> dict[str, Any]:
         """Small structured result for logs and tool messages."""
@@ -25,6 +26,8 @@ class ToolResult:
             payload["message"] = self.message
         if self.error:
             payload["error"] = self.error
+        if self.blocked is not None:
+            payload["blocked"] = self.blocked
         return payload
 
     def as_content(self) -> str | list[dict[str, Any]]:

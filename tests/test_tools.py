@@ -29,6 +29,21 @@ class ToolResultTests(unittest.TestCase):
         self.assertEqual(content[0]["type"], "text")
         self.assertEqual(content[1]["type"], "image_url")
 
+    def test_blocked_field_in_payload(self) -> None:
+        result = ToolResult(ok=True, message="blocked", blocked=True)
+        payload = result.payload()
+        self.assertTrue(payload["blocked"])
+
+    def test_blocked_field_omitted_when_none(self) -> None:
+        result = ToolResult(ok=True, message="moved")
+        payload = result.payload()
+        self.assertNotIn("blocked", payload)
+
+    def test_blocked_false_in_payload(self) -> None:
+        result = ToolResult(ok=True, message="moved", blocked=False)
+        payload = result.payload()
+        self.assertFalse(payload["blocked"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -147,6 +147,43 @@ def tool_schemas(
             "fails or you are stuck, then try a better plan.",
         ),
         _tool(
+            "toggle_grid",
+            "Toggle a coordinate grid overlay on screenshots. When enabled, "
+            "each tile is labeled with its row and column (e.g. r3c2) so you "
+            "can reference positions precisely. Pass {\"enabled\": true} to "
+            "turn on, {\"enabled\": false} to turn off.",
+            {
+                "type": "object",
+                "properties": {
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "True to show the grid, false to hide it.",
+                    }
+                },
+                "required": ["enabled"],
+                "additionalProperties": False,
+            },
+        ),
+        _tool(
+            "toggle_walkability",
+            "Toggle a walkability overlay on screenshots. When enabled, "
+            "walkable tiles are tinted green and blocked tiles are tinted "
+            "red, based on floor color analysis. This helps you see which "
+            "areas are open paths. Pass {\"enabled\": true} to turn on, "
+            "{\"enabled\": false} to turn off.",
+            {
+                "type": "object",
+                "properties": {
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "True to show walkability, false to hide it.",
+                    }
+                },
+                "required": ["enabled"],
+                "additionalProperties": False,
+            },
+        ),
+        _tool(
             "set_boxes",
             "Replace the persistent bounding-box overlay on screenshots. "
             f"Coordinates are {coordinate_text} as "

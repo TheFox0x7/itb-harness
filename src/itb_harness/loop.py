@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 from .agent import ChatAgent, MistralAgent, ModelToolCall, ModelTurn
 from .annotate import BoxAnnotation, annotate_boxes
+from .board_overlay import annotate_combined, default_grid
 from .board_tools import parse_boxes_args, tool_schemas
 from .capture import (
     BackendUnavailable,
@@ -51,6 +52,34 @@ MOVE_KEYS = {
     "move_right": "right",
 }
 
+
+def _frames_differ(png_a: bytes, png_b: bytes, threshold: float = 0.005) -> bool:
+    """Return True when two PNG screenshots differ enough to indicate a state change.
+
+    Compares mean absolute pixel difference.  A blocked move (character did
+    not move, no animation) produces nearly identical frames; a successful
+    move changes the character position and possibly the step counter.
+    """
+    from io import BytesIO
+
+    import numpy as np
+    from PIL import Image
+
+    try:
+        img_a = Image.open(BytesIO(png_a)).convert("RGB")
+        img_b = Image.open(BytesIO(png_b)).convert("RGB")
+    except Exception:
+        return True  # can't compare → assume changed
+
+    if img_a.size != img_b.size:
+        return True
+
+    arr_a = np.asarray(img_a, dtype=np.int16)
+    arr_b = np.asarray(img_b, dtype=np.int16)
+    diff = np.abs(arr_a - arr_b).mean()
+    # Normalise to 0..1 range (max pixel diff is 255).
+    return bool(diff / 255.0 > threshold)
+
 SYSTEM_PROMPT = """\
 You are controlling Helltaker, a grid-based puzzle game.
 
@@ -64,6 +93,12 @@ Tools:
 - move_right: press the Right arrow.
 - reset_level: press R to restart the current level and clear the
   bounding-box overlay.
+- toggle_grid: toggle a coordinate grid overlay on screenshots. When
+  enabled, each tile is labeled with its row and column (e.g. r3c2).
+  Use this to reference positions precisely and plan paths.
+- toggle_walkability: toggle a walkability overlay. When enabled,
+  walkable tiles are tinted green and blocked tiles are tinted red.
+  Use this to see which areas are open paths vs walls.
 - set_boxes: replace the persistent bounding-box overlay on screenshots.
   Pass `boxes` as a list of `{"box_2d": [xmin, ymin, xmax, ymax],
   "label": string}` objects. Coordinates are screenshot pixels. The overlay
@@ -101,6 +136,91 @@ Pay attention to your previous steps. User can interject and help you on your wa
 
 Call view_board first. After moving, call view_board again when you need to
 see the result or re-orient yourself. Do not describe an action in prose; call a tool.
+
+=== MANDATORY WORKFLOW ===
+
+1. PLAN BEFORE MOVING. After your first view_board, do NOT move yet.
+   Instead, analyze the board and answer these questions in your thinking:
+   - Where is the demon (the goal)?
+   - Where are you (Helltaker, the character in the white suit)?
+   - Where are the skeletons, spike traps, and other obstacles?
+   - What is the shortest path from you to the demon?
+   - How many moves does that path need? Do you have enough steps?
+   Only start moving after you have a complete plan.
+
+2. MARK THE BOARD. After analyzing, use set_boxes to mark key entities:
+   - The demon: label "demon"
+   - Each skeleton: label "skeleton"
+   - Yourself: label "helltaker"
+   - Spike traps: label "spike trap"
+   These boxes persist on all future screenshots, so you can track the
+   board even after old screenshots are removed from your context.
+
+   Also consider enabling overlays to aid your analysis:
+   - toggle_grid: shows row/column labels on each tile (e.g. r3c2)
+   - toggle_walkability: tints walkable tiles green, blocked tiles red
+   These help you see the board geometry and plan paths.
+
+3. CHECK MOVE RESULTS. After every movement tool, the result tells you
+   whether the move was BLOCKED (no step consumed) or consumed a step.
+   - If BLOCKED: do NOT repeat the same move. Immediately try a different
+     direction or call view_board to re-assess. Repeating a blocked move
+     wastes a turn.
+   - If the step counter decreased: the move worked. Continue your plan.
+
+4. AFTER RESET, CHANGE STRATEGY. If you call reset_level, you MUST try a
+   different approach than your previous attempt. If your last attempt went
+   left-then-up, this attempt should go right-then-up, or push skeletons
+   differently. Do not repeat the same moves after a reset.
+   Note: after reset_level, the game may briefly show a title/loading
+   screen. Call view_board once more — the level will appear.
+
+5. OUTPUT ONLY TOOL CALLS. Your entire response should be a single tool
+   call. No prose, no narration, no fake browser/automation output, no
+   descriptions of what you are doing. Just the tool call.
+
+6. KEEP THINKING CONCISE. State your plan in 2-3 sentences, then act.
+   Do not re-analyze the same board state more than once. If you already
+   know the layout, use that knowledge instead of re-examining it.
+
+=== STRATEGIC GUIDANCE ===
+
+These are general puzzle-solving principles. Apply them to any level:
+
+- STUDY THE BOARD GEOMETRY. The map is not always a straight line from
+  start to goal. Look for corridors, gaps, and alternative routes around
+  obstacles. A wall of enemies does not always mean you must fight through
+  it — sometimes the path goes around.
+
+- DISTINGUISH OBSTACLE TYPES. Some things block movement (walls, edges,
+  solid objects). Some things can be pushed or kicked out of the way
+  (skeletons, pushable blocks). Some things are decoration and can be
+  ignored. Observe what happens when you interact with each type.
+
+- KICKING IS A TOOL, NOT A WEAPON. Kicking a skeleton moves it one tile
+  and does not consume extra steps beyond the kick itself. Use kicks
+  strategically: to clear a path, to push an enemy off an edge, or to
+  make space for yourself. Kicking every enemy is usually wasteful.
+
+- THE DEMON IS THE GOAL. She is usually at a fixed position on the map.
+  Plan your route to reach the tile adjacent to her. Sometimes the direct
+  path is blocked and you need to approach from a different direction.
+
+- COUNT YOUR STEPS. Before committing to a path, estimate how many moves
+  it needs. If it exceeds your remaining steps, find a shorter route.
+
+- LEARN FROM BLOCKED MOVES. A blocked move tells you something about the
+  board: there is a wall, edge, or solid object in that direction. Use
+  this information to update your mental map. Do not waste turns probing
+  the same blocked direction repeatedly.
+
+- EXPLORE BEFORE COMMITTING. If you are unsure about a path, take one
+  step to test it, then view_board to see the result. Do not blindly
+  commit to a multi-move plan without checking intermediate states.
+
+- RESET IS A LAST RESORT. Only reset when you have no better option.
+  Before resetting, ask yourself: what did I learn? Can I use that
+  knowledge to try something different without resetting?
 """
 
 
@@ -249,6 +369,7 @@ class Recorder:
             "error": result.error,
             "message": result.message,
             "state_changed": result.state_changed,
+            "blocked": result.blocked,
             "pixel": list(result.pixel) if result.pixel is not None else None,
             "frame": (
                 str(frame_path.relative_to(self.root))
@@ -322,12 +443,16 @@ class HarnessLoop:
 
         self.frame: Frame | None = None
         self.last_frame_path: Path | None = None
+        self._prev_frame_png: bytes | None = None
         self.action_count = 0
         self.step_index = 0
         self.final_text: str | None = None
         self._closed = False
         self.event_callback: Callable[[dict[str, Any]], None] | None = None
         self.box_overlay: list[BoxAnnotation] = []
+        self._show_grid: bool = False
+        self._show_walkability: bool = False
+        self._move_history: list[dict[str, object]] = []
         self._guidance: deque[str] = deque()
         self._guidance_lock = threading.Lock()
 
@@ -388,12 +513,26 @@ class HarnessLoop:
             return len(self._guidance)
 
     def _capture(self) -> Frame:
+        # Save the current frame as "previous" before capturing a new one,
+        # so movement tools can compare before/after to detect blocked moves.
+        if self.frame is not None:
+            self._prev_frame_png = self.frame.png
         frame = self.backend.capture_window(self.target.id)
         self.target = frame.window
         if self.box_overlay:
             frame = replace(
                 frame,
                 png=annotate_boxes(frame.png, self.box_overlay),
+            )
+        if self._show_grid or self._show_walkability:
+            frame = replace(
+                frame,
+                png=annotate_combined(
+                    frame.png,
+                    grid=default_grid(frame.width, frame.height),
+                    show_grid=self._show_grid,
+                    show_walkability=self._show_walkability,
+                ),
             )
         self.frame = frame
         path = self.recorder.save_frame(frame)
@@ -440,6 +579,22 @@ class HarnessLoop:
     def _pause(self) -> None:
         if self.config.action_delay > 0:
             time.sleep(self.config.action_delay)
+
+    def _format_history(self) -> str:
+        """Format recent move history as a compact summary."""
+        if not self._move_history:
+            return ""
+        parts = []
+        for entry in self._move_history[-5:]:
+            tool = str(entry["tool"]).replace("move_", "")
+            blocked = entry["blocked"]
+            if blocked is True:
+                parts.append(f"{tool}✗")
+            elif blocked is False:
+                parts.append(f"{tool}✓")
+            else:
+                parts.append(f"{tool}?")
+        return f"Recent moves: {' '.join(parts)}."
 
     def _execute_tool(
         self, call: ModelToolCall
@@ -519,6 +674,9 @@ class HarnessLoop:
                 self.action_count += 1
                 self._pause()
                 frame = self._capture()
+                # After reset the level restarts, so don't compare against
+                # the pre-reset frame for the next move.
+                self._prev_frame_png = None
                 return (
                     ToolResult(
                         ok=True,
@@ -533,21 +691,94 @@ class HarnessLoop:
                     self.last_frame_path,
                 )
 
+            if call.name == "toggle_grid":
+                args = call.arguments if isinstance(call.arguments, dict) else {}
+                enabled = bool(args.get("enabled", True))
+                self._show_grid = enabled
+                self._pause()
+                frame = self._capture()
+                state = "enabled" if enabled else "disabled"
+                return (
+                    ToolResult(
+                        ok=True,
+                        message=(
+                            f"Grid overlay {state}. "
+                            f"Screenshot attached "
+                            f"({frame.width}x{frame.height})."
+                        ),
+                        image_png=frame.png,
+                    ),
+                    self.last_frame_path,
+                )
+
+            if call.name == "toggle_walkability":
+                args = call.arguments if isinstance(call.arguments, dict) else {}
+                enabled = bool(args.get("enabled", True))
+                self._show_walkability = enabled
+                self._pause()
+                frame = self._capture()
+                state = "enabled" if enabled else "disabled"
+                return (
+                    ToolResult(
+                        ok=True,
+                        message=(
+                            f"Walkability overlay {state}. "
+                            f"Screenshot attached "
+                            f"({frame.width}x{frame.height})."
+                        ),
+                        image_png=frame.png,
+                    ),
+                    self.last_frame_path,
+                )
+
             key = MOVE_KEYS.get(call.name)
             if key is not None:
                 self.input.key(key)
                 self.action_count += 1
                 self._pause()
                 frame = self._capture()
+                # Detect whether the move actually changed the game state
+                # by comparing the new screenshot with the previous one.
+                blocked: bool | None = None
+                if self._prev_frame_png is not None:
+                    changed = _frames_differ(self._prev_frame_png, frame.png)
+                    blocked = not changed
+
+                # Record move in history (keep last 10)
+                self._move_history.append({
+                    "tool": call.name,
+                    "blocked": blocked,
+                })
+                if len(self._move_history) > 10:
+                    self._move_history = self._move_history[-10:]
+
+                # Build history summary for the message
+                history_str = self._format_history()
+
+                if blocked:
+                    message = (
+                        f"Move {key} was BLOCKED — no step consumed. "
+                        f"The screenshot is unchanged. Do NOT repeat this "
+                        f"move. Try a different direction or call "
+                        f"view_board to re-assess. "
+                        f"{history_str} "
+                        f"Screenshot attached "
+                        f"({frame.width}x{frame.height})."
+                    )
+                else:
+                    message = (
+                        f"Moved {key} one tile. Step consumed. "
+                        f"{history_str} "
+                        f"Screenshot attached "
+                        f"({frame.width}x{frame.height})."
+                    )
                 return (
                     ToolResult(
                         ok=True,
-                        message=(
-                            f"Moved {key} one tile. Screenshot attached "
-                            f"({frame.width}x{frame.height})."
-                        ),
+                        message=message,
                         image_png=frame.png,
-                        state_changed=True,
+                        state_changed=not blocked if blocked is not None else True,
+                        blocked=blocked,
                     ),
                     self.last_frame_path,
                 )
@@ -708,6 +939,7 @@ class HarnessLoop:
             ok=result.ok,
             error=result.error,
             message=result.message,
+            blocked=result.blocked,
             pixel=list(result.pixel) if result.pixel is not None else None,
             frame=(
                 str(next_frame.relative_to(self.recorder.root))
@@ -719,7 +951,8 @@ class HarnessLoop:
 
         if self.config.console:
             if result.ok:
-                print(f"  tool {primary.name}: {result.message}")
+                status = "BLOCKED" if result.blocked else "ok"
+                print(f"  tool {primary.name}: [{status}] {result.message}")
             else:
                 print(
                     f"  tool {primary.name}: error={result.error} "

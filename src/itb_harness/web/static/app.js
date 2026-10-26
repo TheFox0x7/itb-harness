@@ -240,6 +240,7 @@ function renderTimeline(options = {}) {
           line.append(argsNode);
         }
         if (!action.ok) line.append(el("span", "badge", action.error || "error"));
+        if (action.blocked === true) line.append(el("span", "badge blocked", "BLOCKED"));
         if (target) line.append(el("span", "frame-ref", target));
         button.append(line);
 
@@ -654,6 +655,18 @@ function updateLiveControls(live) {
   $("#live-stop").disabled = ["stopped", "stopping", "error"].includes(
     stateName
   );
+  // Update overlay toggle button states
+  const overlays = live.overlays ?? {};
+  const gridBtn = $("#overlay-grid");
+  const walkBtn = $("#overlay-walkability");
+  if (gridBtn) {
+    gridBtn.classList.toggle("active", !!overlays.grid);
+    gridBtn.disabled = ["stopped", "stopping", "error"].includes(stateName);
+  }
+  if (walkBtn) {
+    walkBtn.classList.toggle("active", !!overlays.walkability);
+    walkBtn.disabled = ["stopped", "stopping", "error"].includes(stateName);
+  }
 }
 
 function updateLiveActivity() {
@@ -1024,6 +1037,34 @@ $("#live-step").addEventListener("click", () => liveCommand("step"));
 $("#live-resume").addEventListener("click", () => liveCommand("resume"));
 $("#live-pause").addEventListener("click", () => liveCommand("pause"));
 $("#live-stop").addEventListener("click", () => liveCommand("stop"));
+
+async function toggleOverlay(name) {
+  const btn = $(`#overlay-${name}`);
+  if (!btn) return;
+  const currentlyActive = btn.classList.contains("active");
+  const enabled = !currentlyActive;
+  try {
+    const response = await fetch("/api/live/overlay", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, enabled }),
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) {
+      throw new Error(data.detail || "overlay toggle failed");
+    }
+    btn.classList.toggle("active", enabled);
+    // Refresh the run to pick up the new frame with overlay
+    if (state.live?.run_id) {
+      await loadRun(state.live.run_id);
+    }
+  } catch (error) {
+    $("#live-error").textContent = `overlay failed: ${error}`;
+  }
+}
+
+$("#overlay-grid")?.addEventListener("click", () => toggleOverlay("grid"));
+$("#overlay-walkability")?.addEventListener("click", () => toggleOverlay("walkability"));
 
 $("#prev-frame").addEventListener("click", () => showFrame(state.frameIndex - 1));
 $("#next-frame").addEventListener("click", () => showFrame(state.frameIndex + 1));

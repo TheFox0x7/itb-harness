@@ -18,6 +18,8 @@ class ToolSchemaTests(unittest.TestCase):
                 "move_left",
                 "move_right",
                 "reset_level",
+                "toggle_grid",
+                "toggle_walkability",
                 "set_boxes",
                 "add_boxes",
             ],
@@ -121,8 +123,17 @@ class ToolSchemaTests(unittest.TestCase):
         self.assertIn("Black tiles are edges", prompt)
         self.assertIn("obstacles are pushable", prompt)
         self.assertIn("step counter", prompt)
-        self.assertIn("Plan ahead", prompt)
         self.assertIn("reset_level", prompt)
+
+    def test_system_prompt_mentions_mandatory_workflow(self) -> None:
+        prompt = build_system_prompt()
+        self.assertIn("PLAN BEFORE MOVING", prompt)
+        self.assertIn("MARK THE BOARD", prompt)
+        self.assertIn("CHECK MOVE RESULTS", prompt)
+        self.assertIn("BLOCKED", prompt)
+        self.assertIn("AFTER RESET, CHANGE STRATEGY", prompt)
+        self.assertIn("OUTPUT ONLY TOOL CALLS", prompt)
+        self.assertIn("KEEP THINKING CONCISE", prompt)
 
 
 if __name__ == "__main__":

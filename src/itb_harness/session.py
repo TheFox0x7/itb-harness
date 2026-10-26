@@ -135,6 +135,31 @@ class SessionRunner:
         self._emit_status()
         return True
 
+    def set_overlay(self, name: str, enabled: bool) -> bool:
+        """Toggle a board overlay (grid or walkability) on the live loop."""
+        with self._lock:
+            if self.state in {"stopped", "stopping", "error"}:
+                return False
+            loop = self.loop
+        if name == "grid":
+            loop._show_grid = enabled
+        elif name == "walkability":
+            loop._show_walkability = enabled
+        else:
+            return False
+        # Capture a fresh frame with the new overlay state so the
+        # next view_board / movement tool shows it immediately.
+        try:
+            loop._capture()
+        except Exception:
+            pass
+        self._broadcast({
+            "type": "overlay",
+            "name": name,
+            "enabled": enabled,
+        })
+        return True
+
     def join(self, timeout: float | None = None) -> None:
         thread = self._thread
         if thread is not None:
@@ -165,6 +190,10 @@ class SessionRunner:
                 "thread_alive": bool(
                     self._thread is not None and self._thread.is_alive()
                 ),
+                "overlays": {
+                    "grid": getattr(self.loop, "_show_grid", False),
+                    "walkability": getattr(self.loop, "_show_walkability", False),
+                },
             }
 
     # ------------------------------------------------------------------

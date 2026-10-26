@@ -205,6 +205,37 @@ class SessionRunnerTests(unittest.TestCase):
             self.assertEqual(runner.snapshot()["reason"], "user_stop")
             runner.join(timeout=1.0)
 
+    def test_set_overlay_toggles_loop_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = HarnessLoop(
+                FakeBackend(),
+                WINDOW,
+                ScriptedAgent([ModelTurn(content="done")]),
+                StubInput(),
+                LoopConfig(out_dir=Path(tmp)),
+            )
+            runner = SessionRunner(loop)
+            runner.start()
+            try:
+                self.assertTrue(runner.set_overlay("grid", True))
+                self.assertTrue(loop._show_grid)
+                snap = runner.snapshot()
+                self.assertTrue(snap["overlays"]["grid"])
+                self.assertFalse(snap["overlays"]["walkability"])
+
+                self.assertTrue(runner.set_overlay("walkability", True))
+                self.assertTrue(loop._show_walkability)
+                snap = runner.snapshot()
+                self.assertTrue(snap["overlays"]["walkability"])
+
+                self.assertTrue(runner.set_overlay("grid", False))
+                self.assertFalse(loop._show_grid)
+
+                self.assertFalse(runner.set_overlay("invalid", True))
+            finally:
+                runner.stop()
+                runner.join(timeout=1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

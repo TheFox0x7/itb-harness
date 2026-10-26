@@ -30,6 +30,11 @@ class SteerRequest(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
 
 
+class OverlayRequest(BaseModel):
+    name: str = Field(pattern="^(grid|walkability)$")
+    enabled: bool
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -257,6 +262,12 @@ def create_app(runs_dir: Path, live: Any | None = None) -> FastAPI:
     def api_live_steer(payload: SteerRequest) -> dict[str, Any]:
         session = _require_live()
         ok = session.steer(payload.text)
+        return {"ok": ok, **session.snapshot()}
+
+    @app.post("/api/live/overlay")
+    def api_live_overlay(payload: OverlayRequest) -> dict[str, Any]:
+        session = _require_live()
+        ok = session.set_overlay(payload.name, payload.enabled)
         return {"ok": ok, **session.snapshot()}
 
     @app.get("/api/live/events")

@@ -126,6 +126,38 @@ button.primary:hover { background: #258567; }
 .live-follow { margin-left: auto; }
 .live-error { color: var(--error); font-size: 12px; }
 
+.live-overlays {
+  display: inline-flex;
+  gap: 4px;
+  margin-left: 8px;
+}
+
+.overlay-toggle {
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.overlay-toggle:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.overlay-toggle.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.overlay-toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .live-steer {
   display: flex;
   align-items: center;
@@ -519,6 +551,12 @@ button.primary:hover { background: #258567; }
   border-radius: 999px;
   padding: 1px 6px;
   color: var(--muted);
+}
+
+.badge.blocked {
+  border-color: #e05050;
+  color: #ff8080;
+  background: rgba(224, 80, 80, 0.15);
 }
 
 .frame-ref {

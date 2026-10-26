@@ -17,13 +17,19 @@ from itb_harness.agent import (
 )
 from itb_harness.capture import Frame, MonitorInfo, WindowInfo
 from itb_harness.input import InputEvent, StubInput
-from itb_harness.loop import HarnessLoop, LoopConfig
+from itb_harness.loop import HarnessLoop, LoopConfig, _frames_differ
 from itb_harness.notes import NotesStore
 
 
 def tiny_png() -> bytes:
     buffer = BytesIO()
     Image.new("RGB", (10, 10), (0, 0, 0)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def different_png() -> bytes:
+    buffer = BytesIO()
+    Image.new("RGB", (10, 10), (255, 255, 255)).save(buffer, format="PNG")
     return buffer.getvalue()
 
 
@@ -74,6 +80,29 @@ class FakeBackend:
 
     def close(self) -> None:
         pass
+
+
+class SequenceBackend(FakeBackend):
+    """Returns a different PNG on each capture, cycling through a list."""
+
+    def __init__(self, pngs: list[bytes]) -> None:
+        super().__init__(png=pngs[0] if pngs else tiny_png())
+        self._pngs = pngs
+        self._index = 0
+
+    def capture_window(self, window_id: str) -> Frame:
+        self.captures += 1
+        if self._pngs:
+            self._png = self._pngs[self._index % len(self._pngs)]
+            self._index += 1
+        return Frame(
+            window=self.window,
+            png=self._png,
+            width=self.window.width,
+            height=self.window.height,
+            captured_at="2026-10-22T00:00:00+00:00",
+            latency_ms=1.0,
+        )
 
 
 class FakeMistralClient:
@@ -629,6 +658,311 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(len(turn.tool_calls), 1)
         self.assertEqual(turn.tool_calls[0].name, "view_board")
         self.assertEqual(turn.tool_calls[0].arguments, {})
+
+
+class FrameDiffTests(unittest.TestCase):
+    def test_identical_frames_do_not_differ(self) -> None:
+        png = tiny_png()
+        self.assertFalse(_frames_differ(png, png))
+
+    def test_different_frames_differ(self) -> None:
+        self.assertTrue(_frames_differ(tiny_png(), different_png()))
+
+    def test_different_sizes_differ(self) -> None:
+        buf_a = BytesIO()
+        Image.new("RGB", (10, 10), (0, 0, 0)).save(buf_a, format="PNG")
+        buf_b = BytesIO()
+        Image.new("RGB", (20, 20), (0, 0, 0)).save(buf_b, format="PNG")
+        self.assertTrue(_frames_differ(buf_a.getvalue(), buf_b.getvalue()))
+
+    def test_invalid_png_assumes_differ(self) -> None:
+        self.assertTrue(_frames_differ(b"not a png", b"also not a png"))
+
+
+class BlockedMoveTests(unittest.TestCase):
+    def test_blocked_move_when_frames_identical(self) -> None:
+        """When the screenshot doesn't change after a move, it was blocked."""
+        png = tiny_png()
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("move_up"),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            win = WINDOW
+            backend = FakeBackend(png=png)
+            backend.window = win
+            agent = ScriptedAgent(turns)
+            pointer = StubInput()
+            loop = HarnessLoop(
+                backend,
+                win,
+                agent,
+                pointer,
+                LoopConfig(
+                    max_steps=10,
+                    max_images=4,
+                    action_delay=0.0,
+                    out_dir=Path(tmp),
+                ),
+            )
+            result = loop.run()
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            move_record = records[1]
+            self.assertEqual(move_record["tool"], "move_up")
+            self.assertTrue(move_record["blocked"])
+            self.assertIn("BLOCKED", move_record["message"])
+            self.assertFalse(move_record["state_changed"])
+
+    def test_successful_move_when_frames_differ(self) -> None:
+        """When the screenshot changes after a move, a step was consumed."""
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("move_up"),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            win = WINDOW
+            # Alternate between two different PNGs so the move changes the frame
+            backend = SequenceBackend([tiny_png(), different_png()])
+            backend.window = win
+            agent = ScriptedAgent(turns)
+            pointer = StubInput()
+            loop = HarnessLoop(
+                backend,
+                win,
+                agent,
+                pointer,
+                LoopConfig(
+                    max_steps=10,
+                    max_images=4,
+                    action_delay=0.0,
+                    out_dir=Path(tmp),
+                ),
+            )
+            result = loop.run()
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            move_record = records[1]
+            self.assertEqual(move_record["tool"], "move_up")
+            self.assertFalse(move_record["blocked"])
+            self.assertIn("Step consumed", move_record["message"])
+
+    def test_reset_clears_prev_frame(self) -> None:
+        """After reset, the next move compares against the post-reset frame."""
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("reset_level"),)),
+            ModelTurn(tool_calls=(call("move_up"),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            win = WINDOW
+            # Sequence: view_board → reset frame → move frame (different from reset)
+            backend = SequenceBackend([tiny_png(), different_png(), tiny_png()])
+            backend.window = win
+            agent = ScriptedAgent(turns)
+            pointer = StubInput()
+            loop = HarnessLoop(
+                backend,
+                win,
+                agent,
+                pointer,
+                LoopConfig(
+                    max_steps=10,
+                    max_images=4,
+                    action_delay=0.0,
+                    out_dir=Path(tmp),
+                ),
+            )
+            result = loop.run()
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            move_record = records[2]
+            self.assertEqual(move_record["tool"], "move_up")
+            # After reset, the move compares against the reset frame.
+            # Since the move frame differs from the reset frame, it's not blocked.
+            self.assertFalse(move_record["blocked"])
+            self.assertIn("Step consumed", move_record["message"])
+
+    def test_tool_result_includes_blocked_in_message(self) -> None:
+        """The tool message sent to the model should mention BLOCKED status."""
+        png = tiny_png()
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("move_up"),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            win = WINDOW
+            backend = FakeBackend(png=png)
+            backend.window = win
+            agent = ScriptedAgent(turns)
+            pointer = StubInput()
+            loop = HarnessLoop(
+                backend,
+                win,
+                agent,
+                pointer,
+                LoopConfig(
+                    max_steps=10,
+                    max_images=4,
+                    action_delay=0.0,
+                    out_dir=Path(tmp),
+                ),
+            )
+            loop.run()
+            # Find the tool message for the move_up call
+            tool_messages = [
+                m for m in loop.messages
+                if m.get("role") == "tool" and m.get("name") == "move_up"
+            ]
+            self.assertEqual(len(tool_messages), 1)
+            content = tool_messages[0]["content"]
+            if isinstance(content, list):
+                text = content[0]["text"]
+            else:
+                text = content
+            payload = json.loads(text)
+            self.assertTrue(payload["blocked"])
+            self.assertIn("BLOCKED", payload["message"])
+
+
+class OverlayToolTests(unittest.TestCase):
+    def test_toggle_grid(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("toggle_grid", {"enabled": True}),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(turns, Path(tmp))
+            self.assertTrue(loop._show_grid)
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(records[1]["tool"], "toggle_grid")
+            self.assertIn("enabled", records[1]["message"])
+
+    def test_toggle_walkability(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("toggle_walkability", {"enabled": True}),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(turns, Path(tmp))
+            self.assertTrue(loop._show_walkability)
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl").read_text().splitlines()
+            ]
+            self.assertEqual(records[1]["tool"], "toggle_walkability")
+            self.assertIn("enabled", records[1]["message"])
+
+    def test_toggle_grid_off(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("toggle_grid", {"enabled": True}),)),
+            ModelTurn(tool_calls=(call("toggle_grid", {"enabled": False}),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(turns, Path(tmp))
+            self.assertFalse(loop._show_grid)
+
+
+class MoveHistoryTests(unittest.TestCase):
+    def test_history_in_tool_message(self) -> None:
+        """Movement tool results should include recent move history."""
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("move_up"),)),
+            ModelTurn(tool_calls=(call("move_up"),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            win = WINDOW
+            backend = SequenceBackend([tiny_png(), different_png(), tiny_png(), different_png()])
+            backend.window = win
+            agent = ScriptedAgent(turns)
+            pointer = StubInput()
+            loop = HarnessLoop(
+                backend,
+                win,
+                agent,
+                pointer,
+                LoopConfig(
+                    max_steps=10,
+                    max_images=4,
+                    action_delay=0.0,
+                    out_dir=Path(tmp),
+                ),
+            )
+            loop.run()
+            # Check that move history was recorded
+            self.assertEqual(len(loop._move_history), 2)
+            # Check that the second move's message includes history
+            tool_messages = [
+                m for m in loop.messages
+                if m.get("role") == "tool" and m.get("name") == "move_up"
+            ]
+            self.assertEqual(len(tool_messages), 2)
+            content = tool_messages[1]["content"]
+            if isinstance(content, list):
+                text = content[0]["text"]
+            else:
+                text = content
+            payload = json.loads(text)
+            self.assertIn("Recent moves:", payload["message"])
+
+    def test_history_shows_blocked(self) -> None:
+        """Blocked moves should show ✗ in history."""
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("move_up"),)),  # blocked (same frame)
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            win = WINDOW
+            backend = FakeBackend(png=tiny_png())
+            backend.window = win
+            agent = ScriptedAgent(turns)
+            pointer = StubInput()
+            loop = HarnessLoop(
+                backend,
+                win,
+                agent,
+                pointer,
+                LoopConfig(
+                    max_steps=10,
+                    max_images=4,
+                    action_delay=0.0,
+                    out_dir=Path(tmp),
+                ),
+            )
+            loop.run()
+            tool_messages = [
+                m for m in loop.messages
+                if m.get("role") == "tool" and m.get("name") == "move_up"
+            ]
+            content = tool_messages[0]["content"]
+            if isinstance(content, list):
+                text = content[0]["text"]
+            else:
+                text = content
+            payload = json.loads(text)
+            # First move has no history yet (or just itself)
+            # The blocked status should be in the message
+            self.assertTrue(payload["blocked"])
 
 
 if __name__ == "__main__":
