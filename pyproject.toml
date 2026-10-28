@@ -9,26 +9,29 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
+    "mcp>=2.0,<3",
     "mistralai>=3.3.0",
     "numpy>=2.0",
     "pillow>=11.0",
     "pydantic>=2.0",
     "uvicorn>=0.30",
+    "python-xlib>=0.33",
 ]
 
 [project.scripts]
 itb-harness = "itb_harness:main"
 itb-agent = "itb_harness.loop:main"
 itb-web = "itb_harness.web:main"
+itb-mcp = "itb_mcp.server:main"
 
 [project.optional-dependencies]
 kde = [
     "kwcapture>=0.7.0",
 ]
-x11 = [
-    "python-xlib>=0.33",
-]
 
 [build-system]
 requires = ["uv_build>=0.13.4,<0.14.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = ["itb_harness", "itb_mcp"]

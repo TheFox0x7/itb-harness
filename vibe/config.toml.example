@@ -1,0 +1,41 @@
+# Add this table to ~/.vibe/config.toml, or run:
+#
+#   vibe mcp add itb_harness --transport stdio \
+#     --command uv \
+#     --arg=run --arg=--extra --arg=x11 \
+#     --arg=--directory --arg=/home/fox/repos/itb-harness \
+#     --arg=itb-mcp \
+#     --env ITB_MCP_BACKEND=x11 \
+#     --env ITB_MCP_INPUT=x11 \
+#     --env ITB_MCP_WINDOW=Helltaker \
+#     --env ITB_MCP_RUNS=/home/fox/repos/itb-harness/runs \
+#     --env ITB_MCP_NOTES=/home/fox/repos/itb-harness/notes.md
+
+[[mcp_servers]]
+name = "itb_harness"
+transport = "stdio"
+command = "uv"
+args = [
+  "run",
+  "--extra",
+  "x11",
+  "--directory",
+  "/home/fox/repos/itb-harness",
+  "itb-mcp",
+]
+# Captures include the action delay, so allow more than the 60 s default.
+tool_timeout_sec = 120
+
+[mcp_servers.env]
+ITB_MCP_BACKEND = "x11"
+ITB_MCP_INPUT = "x11"
+ITB_MCP_WINDOW = "Helltaker"
+ITB_MCP_RUNS = "/home/fox/repos/itb-harness/runs"
+ITB_MCP_NOTES = "/home/fox/repos/itb-harness/notes.md"
+
+# For gamescope, also point the server at the game's nested X display:
+# DISPLAY = ":2"
+# XAUTHORITY = "/run/user/1000/xauth_..."
+#
+# On KDE Plasma 6 Wayland without gamescope, use --extra kde and
+# ITB_MCP_BACKEND = "kwin" instead.

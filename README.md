@@ -45,6 +45,115 @@ or the gamescope window, not the nested X root. `auto` detects a non-`:0`
 `DISPLAY` in a Wayland session as a nested X server, but `--backend x11` is
 explicit and recommended.
 
+## MCP server (Mistral Vibe)
+
+`itb-mcp` exposes the game over the Model Context Protocol. The MCP client
+(Vibe) owns the agent loop, conversation, and context management; the server
+owns screenshots, input, overlays, move history, and optional run recording.
+
+```bash
+uv sync --extra x11          # or --extra kde
+uv run itb-mcp --list-windows
+DISPLAY=:2 XAUTHORITY=/run/user/1000/xauth_... \
+  uv run itb-mcp --backend x11 --window Helltaker --input x11
+```
+
+The server speaks stdio by default. `--transport sse` and
+`--transport streamable-http` are also available (`--host`, `--port`).
+
+### Tools
+
+| Tool | Args | Effect |
+|---|---|---|
+| `view_board` | — | Capture and return the current screen |
+| `move` | `direction` (`up`/`down`/`left`/`right`) | Press one arrow key, capture, and report `BLOCKED` or a consumed step |
+| `reset_level` | — | Press `R`, clear boxes, and capture |
+| `toggle_grid` | `enabled` | Row/column labels on every tile |
+| `toggle_walkability` | `enabled` | Green/red walkability tint |
+| `set_boxes` | `boxes` | Replace the persistent box overlay |
+| `add_boxes` | `boxes` | Append to the box overlay |
+| `start_run` | `notes` (optional) | Begin recording frames and actions |
+| `end_run` | — | Stop recording and summarize |
+| `list_windows` | — | List capturable windows |
+| `select_window` | `selector` | Change the game window |
+| `read_notes` / `append_notes` / `write_notes` | `text` | Persistent notes across runs |
+
+Box items use `{"box_2d": [xmin, ymin, xmax, ymax], "label": "demon"}` in
+screenshot pixels (or 1..1000 scaled coordinates with `--scaled-boxes`).
+`--strict-box-labels` restricts labels to `spike trap`, `skeleton`, `rock`,
+`demon`, and `helltaker`.
+
+### Resources
+
+- `helltaker://state` — current frame size, overlays, boxes, move history, run state
+- `helltaker://runs` — recorded runs, newest first
+- `helltaker://runs/{run_id}` — metadata, actions, turns, frame names
+- `helltaker://runs/{run_id}/frames/{name}` — one PNG frame
+- `helltaker://runs/{run_id}/actions` — structured action log
+- `helltaker://runs/{run_id}/conversation` — action transcript (reasoning lives in the client)
+- `helltaker://notes` — persistent notes
+
+### Prompts
+
+- `helltaker-rules` — mechanics and tool descriptions
+- `helltaker-strategy` — puzzle-solving guidance
+- `helltaker-workflow` — plan / mark / move / verify loop
+- `helltaker-level-guide` — `level: int`; extracts matching notes or returns general guidance
+
+### Configuration
+
+All settings can be passed as flags or environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ITB_MCP_BACKEND` | `auto` | Capture backend: `auto`, `kwin`, `x11` |
+| `ITB_MCP_INPUT` | `x11` | Input backend: `x11` or `stub` |
+| `ITB_MCP_WINDOW` | auto-detect | Window index, id, app id, or title substring |
+| `ITB_MCP_RUNS` | `runs` | Run output directory |
+| `ITB_MCP_NOTES` | `notes.md` | Persistent notes file |
+| `ITB_MCP_ACTION_DELAY` | `0.35` | Seconds between key press and capture |
+| `ITB_MCP_STRICT_BOX_LABELS` | `false` | Restrict box labels |
+| `ITB_MCP_SCALED_BOXES` | `false` | Use 1..1000 box coordinates |
+
+When no window is configured, the server picks the only window whose title or
+app id contains `Helltaker`. If none or several match, use `list_windows` and
+`select_window`, or set `ITB_MCP_WINDOW`.
+
+### Vibe setup
+
+Add the server to `~/.vibe/config.toml` (see `vibe/config.toml.example`):
+
+```toml
+[[mcp_servers]]
+name = "itb_harness"
+transport = "stdio"
+command = "uv"
+args = ["run", "--extra", "x11", "--directory", "/home/fox/repos/itb-harness", "itb-mcp"]
+tool_timeout_sec = 120
+
+[mcp_servers.env]
+ITB_MCP_BACKEND = "x11"
+ITB_MCP_INPUT = "x11"
+ITB_MCP_WINDOW = "Helltaker"
+ITB_MCP_RUNS = "/home/fox/repos/itb-harness/runs"
+ITB_MCP_NOTES = "/home/fox/repos/itb-harness/notes.md"
+```
+
+Vibe prefixes tool names with the server name (`itb_harness_move`,
+`itb_harness_view_board`, ...). Copy the companion skill to your Vibe skills
+directory:
+
+```bash
+mkdir -p ~/.vibe/skills/helltaker
+cp vibe/skills/helltaker/SKILL.md ~/.vibe/skills/helltaker/SKILL.md
+```
+
+Runs recorded through MCP use the same on-disk layout as the headless harness,
+with a `-mcp` suffix and no `conversation.jsonl` (the client owns the
+conversation). They are visible in `itb-web`.
+
+Tests: `uv run python -m unittest discover -s tests`.
+
 ## Run
 
 ```bash

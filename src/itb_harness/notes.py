@@ -15,9 +15,15 @@ DEFAULT_MAX_CHARS = 6000
 
 
 class NotesStore:
-    def __init__(self, path: Path, max_chars: int = DEFAULT_MAX_CHARS) -> None:
+    def __init__(
+        self,
+        path: Path,
+        max_chars: int = DEFAULT_MAX_CHARS,
+        title: str = "Into the Breach harness notes",
+    ) -> None:
         self.path = path
         self.max_chars = max(1000, max_chars)
+        self.title = title
 
     def read(self) -> str:
         try:
@@ -61,8 +67,14 @@ class NotesStore:
 
         with self.path.open("a", encoding="utf-8") as handle:
             if new_file:
-                handle.write("# Into the Breach harness notes\n\n")
+                handle.write(f"# {self.title}\n\n")
             handle.write(f"## {stamp}{suffix}\n{clean}\n\n")
+
+    def write(self, text: str) -> None:
+        """Replace the whole notes file with ``text``."""
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(text.strip() + "\n", encoding="utf-8")
 
     @property
     def char_count(self) -> int:
