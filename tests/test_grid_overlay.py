@@ -71,6 +71,27 @@ class GridOverlayTests(unittest.TestCase):
         left_line = result.getpixel((94, 50))
         self.assertGreater(left_line[2], blank[2])
 
+    def test_level_map_symbols_can_be_drawn(self) -> None:
+        image = Image.new("RGB", (800, 300), (0, 0, 0))
+        pixels = np.asarray(image).copy()
+        pixels[100:150, 300:400] = (112, 12, 41)
+        image = Image.fromarray(pixels)
+        png = png_bytes(image)
+
+        plain = Image.open(BytesIO(annotate_helltaker_grid(png))).convert("RGB")
+        mapped = Image.open(
+            BytesIO(
+                annotate_helltaker_grid(
+                    png,
+                    [["H", "X"], ["S", "D"]],
+                )
+            )
+        ).convert("RGB")
+
+        # 2x2 map is centered and bottom-aligned to the anchor at y=150.
+        for x, y in ((366, 42), (434, 114)):
+            self.assertNotEqual(mapped.getpixel((x, y)), plain.getpixel((x, y)))
+
     def test_cell_dimensions(self) -> None:
         self.assertEqual(CELL_WIDTH, 68)
         self.assertEqual(CELL_HEIGHT, 72)

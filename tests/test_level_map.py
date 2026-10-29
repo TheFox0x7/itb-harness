@@ -73,6 +73,10 @@ class LevelMapParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "single non-space"):
             parse_level_map_args({"rows": ["[wall] [X]"]})
 
+    def test_unknown_cells_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "no longer support"):
+            parse_level_map_args({"rows": ["X?X"]})
+
 
 class MoveMapUpdateTests(unittest.TestCase):
     def test_moves_into_empty_cell(self) -> None:
@@ -121,6 +125,23 @@ class MoveMapUpdateTests(unittest.TestCase):
         )
         self.assertIsNone(
             apply_move_to_level_map([["H", "R", "?"]], "move_right")
+        )
+
+    def test_player_can_step_on_spikes(self) -> None:
+        self.assertEqual(
+            apply_move_to_level_map([["H", "T", "D"]], "move_right"),
+            [[".", "H", "D"]],
+        )
+
+    def test_key_removes_barriers(self) -> None:
+        self.assertEqual(
+            apply_move_to_level_map([["H", "K", "B"]], "move_right"),
+            [[".", "H", "."]],
+        )
+
+    def test_barrier_blocks_movement(self) -> None:
+        self.assertIsNone(
+            apply_move_to_level_map([["H", "B"]], "move_right")
         )
 
     def test_move_outside_map_or_without_player_is_ignored(self) -> None:

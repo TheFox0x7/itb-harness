@@ -24,6 +24,7 @@ from .board_tools import (
     apply_move_to_level_map,
     format_level_map,
     parse_level_map_args,
+    parse_validate_solution_args,
     tool_schemas,
 )
 from .grid_overlay import annotate_helltaker_grid
@@ -40,6 +41,7 @@ from .cli import format_windows
 from .input import InputBackend, get_input_backend
 from .notes import NotesStore
 from .tools import ToolResult
+from .validator import validate_solution
 
 
 INPUT_TOOLS = {
@@ -48,6 +50,8 @@ INPUT_TOOLS = {
     "move_left",
     "move_right",
     "reset_level",
+    "press_space",
+    "execute_plan",
 }
 MOVE_KEYS = {
     "move_up": "up",
@@ -90,20 +94,35 @@ You are controlling Helltaker, a grid-based puzzle game.
 You do not receive screenshots automatically. Use view_board to capture the
 current game screen.
 
-Screenshots include a grid overlay: 68x72 pixel cells, up to 9 columns centered
-on the screen, anchored to the red floor.
+Screenshots include a red grid overlay with 9 columns. The bottom row of the
+grid is anchored to the lowest red floor row. Use the grid lines to identify
+each tile's row and column when building your map. The grid may have a partial
+row at the top; count rows from the bottom up.
 
 Tools:
-- move_up: press the Up arrow.
-- move_down: press the Down arrow.
-- move_left: press the Left arrow.
-- move_right: press the Right arrow.
+- view_board: capture and return the current game screenshot.
+- move_up: press the Up arrow and move one tile.
+- move_down: press the Down arrow and move one tile.
+- move_left: press the Left arrow and move one tile.
+- move_right: press the Right arrow and move one tile.
 - reset_level: press R to restart the current level and clear the level map.
 - level_map: create or update your own text map of the level. Pass `rows`
   as a list of equal-width rows, for example ["[X] [X] [H]", "[X] [.] [D]"].
-  Suggested symbols: X=wall/blocked, .=open floor, H=Helltaker, S=skeleton,
-  T=spike trap, D=demon, R=rock, ?=unknown. Use `updates` to change individual cells
-  or `clear` to remove the map. It does not change the game.
+  Symbols: X=wall/blocked, .=open floor, H=Helltaker, S=skeleton,
+  T=spike trap, D=demon, R=rock, K=key, B=barrier. Use `updates` to change
+  individual cells (row/col are 0-based) or `clear` to remove the map.
+  The map is your scratchpad; it does not change the game.
+- validate_solution: validate a proposed move list against the current
+  level_map. It does not move the character. Pass `moves`, `max_steps`, and
+  `spike_mode` (static, up, or down). Every move must be legal and H must
+  finish adjacent to D. Use this to test plans before committing.
+- execute_plan: re-validate and then execute the same move list on the real
+  game. Only movement steps are allowed in the list. Execution aborts on the
+  first blocked move.
+- press_space: press the spacebar for dialogue, confirmations, and menus.
+  This is not a movement step and cannot be included in a plan.
+- toggle_map_overlay: show or hide your level_map symbols on screenshots.
+  Enable it to visually verify that your map rows align with the actual tiles.
 
 Each movement tool moves exactly one tile. Movement is tile-based: a move
 should advance one tile unless blocked by a wall, object, or the edge of the
@@ -120,7 +139,7 @@ Game rules:
 - Many obstacles are pushable by moving into them.
 - Assume you can only move on the red space. Everything else is blocked. Rocks on the playing field might also be red and impassible
   but they are distinct from flat ground you can navigate.
-- Moving into the wall or edges is not a valid move and will not consume steps. 
+- Moving into the wall or edges is not a valid move and will not consume steps.
   However it is wasting your time so it is recommended for you to reexamine if your move consumed steps and if not, change strategy.
 - Pillars are usually either obstacles or decoration. They aren't interactive and you can ignore them.
 - White flashes on black screen means you ran out of steps and lost. Next call to view screen will return level as it was after reset.
@@ -132,48 +151,100 @@ Trial and error are part of the learning experience and no one expects you to be
 however you are encouraged to learn from your attempts on what worked well what did not.
 Pay attention to your previous steps. User can interject and help you on your way.
 
-Call view_board first. After moving, call view_board again when you need to
-see the result or re-orient yourself. Do not describe an action in prose; call a tool.
-
-Use the map to navigate and plan your moves. The map autoupdates on successful moves but does not take everything into account.
-If your move is blocked but map has no obstacle that would suggest it, it means you mapped it out incorrectly. Look at it again instead of repeating.
-
 === MANDATORY WORKFLOW ===
 
-1. PLAN BEFORE MOVING. After your first view_board, do NOT move yet.
-   Instead, analyze the board and answer these questions in your thinking:
-   - Where is the demon (the goal)?
-   - Where are you (Helltaker, the character in the white suit)?
-   - Where are the skeletons, spike traps, and other obstacles?
-   - What is the shortest path from you to the demon?
-   - How many moves does that path need? Do you have enough steps?
-   Only start moving after you have a complete plan.
+=== PHASE 1: RECON — BUILD AN ACCURATE MAP BEFORE MOVING ===
 
-2. MARK THE BOARD. After analyzing use level_map once you understand the layout, then update it
-   after moves or new observations so it stays accurate. The current map is
-   included with subsequent tool results.
+1. OBSERVE. Call view_board to get the first screenshot. Study the grid
+   overlay carefully: identify the bottom-anchored row, count columns left
+   to right, and note every visible tile type.
 
-3. CHECK MOVE RESULTS. After every movement tool, the result tells you
-   whether the move was BLOCKED (no step consumed) or consumed a step.
-   - If BLOCKED: do NOT repeat the same move. Immediately try a different
-     direction or call view_board to re-assess. Repeating a blocked move
-     wastes a turn.
-   - If the step counter decreased: the move worked. Continue your plan.
+2. TRANSCRIBE. Build the complete level_map in one call. Walk row by row
+   from top to bottom, marking every tile you can see:
+   - X for walls, black edges, and any solid blocked tile
+   - . for open red floor
+   - H for yourself, D for the demon, S for skeletons, R for rocks,
+     T for spikes, K for keys, B for barriers
+   Do not leave any visible tile unmapped. The map must be rectangular
+   (all rows the same width). If the top row is partial, pad shorter
+   rows with X on the sides that are off-screen.
 
-4. AFTER RESET, CHANGE STRATEGY. If you call reset_level, you MUST try a
-   different approach than your previous attempt. If your last attempt went
-   left-then-up, this attempt should go right-then-up, or push skeletons
-   differently. Do not repeat the same moves after a reset.
-   Note: after reset_level, the game may briefly show a title/loading
-   screen. Call view_board once more — the level will appear.
+3. VERIFY ALIGNMENT. Call toggle_map_overlay with enabled=true, then
+   view_board. Your map symbols should appear centered on the matching
+   tiles. If symbols are shifted, misaligned, or on the wrong tiles,
+   fix the map with level_map updates before proceeding. Do not move
+   until the overlay matches the screenshot.
 
-5. OUTPUT ONLY TOOL CALLS. Your entire response should be a single tool
-   call. No prose, no narration, no fake browser/automation output, no
-   descriptions of what you are doing. Just the tool call.
+4. RE-RECON WHEN NEEDED. If part of the level is hidden (fog, off-screen,
+   or obscured), note those cells and explore them before finalizing your
+   plan. An incomplete map leads to invalid plans.
 
-6. KEEP THINKING CONCISE. State your plan in 2-3 sentences, then act.
-   Do not re-analyze the same board state more than once. If you already
-   know the layout, use that knowledge instead of re-examining it.
+=== PHASE 2: PLAN — DESIGN THE FULL ROUTE BEFORE MOVING ===
+
+5. PLAN THE COMPLETE ROUTE. Using your verified map, trace a path from H
+   to a tile adjacent to D. Consider:
+   - Direct paths vs. detours around obstacles
+   - Whether to kick skeletons out of the way or go around them
+   - Whether to push rocks to clear a path or block enemy movement
+   - Key/barrier sequences: you must step on K before B becomes passable
+   - Spike timing: hidden spikes cost 2 will, extended spikes cost 1
+     (they retract before you enter on alternating modes)
+   - Your remaining step budget (visible on the left counter)
+   Write out the full move sequence as a list of move_up/move_down/
+   move_left/move_right before calling any movement tool.
+
+6. VALIDATE BEFORE EXECUTING. Always call validate_solution with your
+   planned moves, the level's max_steps, and the correct spike_mode.
+   - If validation FAILS: read the error reason carefully. It tells you
+     exactly which step is illegal and why (wall, out of bounds, wrong
+     final position, exceeded will). Fix your plan and re-validate.
+     Do NOT call execute_plan until validation passes.
+   - If validation PASSES: call execute_plan with the same arguments.
+
+=== PHASE 3: EXECUTE AND VERIFY ===
+
+7. EXECUTE THE PLAN. Call execute_plan. It re-validates and plays the
+   moves one at a time. It aborts on the first blocked move.
+
+8. VERIFY THE RESULT. After execute_plan, call view_board to see the
+   result. Compare the screenshot with your map:
+   - If the character is where you expected: great, continue or finish.
+   - If the plan aborted early (blocked move): the map has an error.
+     Go to step 9.
+
+=== PHASE 4: MAP ERROR CORRECTION ===
+
+9. FIX MAP ERRORS IMMEDIATELY. When reality disagrees with your map:
+   - A move was BLOCKED but your map shows an open tile: the map is wrong.
+     Call view_board, identify what is actually in that cell, then call
+     level_map with `updates` to correct that cell (and any neighbors you
+     can now see). Do NOT repeat the same blocked move.
+   - A move succeeded but the character is not where the map predicted:
+     the map had a wrong symbol. Update it with level_map updates.
+   - You see a new tile type you did not map: add it to the map.
+   After fixing the map, re-verify with toggle_map_overlay + view_board,
+   then go back to PHASE 2 and re-plan.
+
+10. SINGLE-STEP EXPLORATION. If you are unsure about a tile or interaction,
+    take ONE exploratory move, call view_board, update the map, then plan.
+    Do not chain multiple exploratory moves without checking the result.
+
+=== GENERAL RULES ===
+
+11. AFTER RESET, CHANGE STRATEGY. If you call reset_level, you MUST try a
+    different approach than your previous attempt. If your last attempt went
+    left-then-up, this attempt should go right-then-up, or push skeletons
+    differently. Do not repeat the same moves after a reset.
+    Note: after reset_level, the game may briefly show a title/loading
+    screen. Call view_board once more — the level will appear.
+
+12. OUTPUT ONLY TOOL CALLS. Your entire response should be a single tool
+    call. No prose, no narration, no fake browser/automation output, no
+    descriptions of what you are doing. Just the tool call.
+
+13. KEEP THINKING CONCISE. State your plan in 2-3 sentences, then act.
+    Do not re-analyze the same board state more than once. If you already
+    know the layout, use that knowledge instead of re-examining it.
 
 === STRATEGIC GUIDANCE ===
 
@@ -197,14 +268,15 @@ These are general puzzle-solving principles. Apply them to any level:
 - THE DEMON IS THE GOAL. She is usually at a fixed position on the map.
   Plan your route to reach the tile adjacent to her. Sometimes the direct
   path is blocked and you need to approach from a different direction.
+  Demon usually has a heart bubble next to it.
 
 - COUNT YOUR STEPS. Before committing to a path, estimate how many moves
   it needs. If it exceeds your remaining steps, find a shorter route.
 
 - LEARN FROM BLOCKED MOVES. A blocked move tells you something about the
   board: there is a wall, edge, or solid object in that direction. Use
-  this information to update your mental map. Do not waste turns probing
-  the same blocked direction repeatedly.
+  this information to update your map with level_map updates. Do not waste
+  turns probing the same blocked direction repeatedly.
 
 - EXPLORE BEFORE COMMITTING. If you are unsure about a path, take one
   step to test it, then view_board to see the result. Do not blindly
@@ -485,6 +557,7 @@ class HarnessLoop:
         self._closed = False
         self.event_callback: Callable[[dict[str, Any]], None] | None = None
         self.level_map: list[list[str]] | None = None
+        self.show_level_map_overlay: bool = False
         self._move_history: list[dict[str, object]] = []
         self._guidance: deque[str] = deque()
         self._guidance_lock = threading.Lock()
@@ -546,6 +619,7 @@ class HarnessLoop:
         self.last_frame_path = None
         self._prev_frame_png = None
         self.level_map = None
+        self.show_level_map_overlay = False
         self._move_history.clear()
         with self._guidance_lock:
             self._guidance.clear()
@@ -652,6 +726,117 @@ class HarnessLoop:
                 parts.append(f"{tool}?")
         return f"Recent moves: {' '.join(parts)}."
 
+    def _move(self, direction: str) -> tuple[ToolResult, Path | None]:
+        key = MOVE_KEYS[direction]
+        self.input.key(key)
+        self.action_count += 1
+        self._pause()
+        frame = self._capture()
+
+        # Detect whether the move actually changed the game state by comparing
+        # the new screenshot with the previous one.
+        blocked: bool | None = None
+        if self._prev_frame_png is not None:
+            changed = _frames_differ(self._prev_frame_png, frame.png)
+            blocked = not changed
+
+        self._move_history.append({"tool": direction, "blocked": blocked})
+        if len(self._move_history) > 10:
+            self._move_history = self._move_history[-10:]
+
+        history_str = self._format_history()
+        if blocked:
+            message = (
+                f"Move {key} was BLOCKED — no step consumed. "
+                f"Do NOT repeat this move. Try a different direction or call "
+                f"view_board to re-assess. {history_str}"
+            )
+        else:
+            message = (
+                f"Moved {key} one tile. Step consumed. {history_str} "
+                "Call view_board to see the result."
+            )
+        return (
+            ToolResult(
+                ok=True,
+                message=message,
+                state_changed=not blocked if blocked is not None else True,
+                blocked=blocked,
+            ),
+            self.last_frame_path,
+        )
+
+    def _execute_plan(
+        self, call: ModelToolCall
+    ) -> tuple[ToolResult, Path | None]:
+        if not self.level_map:
+            raise ValueError(
+                "Call level_map with rows before execute_plan."
+            )
+        moves, max_steps, spike_mode = parse_validate_solution_args(
+            call.arguments
+        )
+        outcome = validate_solution(
+            self.level_map,
+            moves,
+            max_steps,
+            spike_mode,
+        )
+        if not outcome.ok:
+            return (
+                ToolResult(
+                    ok=False,
+                    error="invalid_solution",
+                    message=f"Plan rejected: {outcome.reason}",
+                ),
+                None,
+            )
+
+        executed = 0
+        for index, move in enumerate(moves, start=1):
+            result, frame_path = self._move(move)
+            if result.blocked:
+                return (
+                    ToolResult(
+                        ok=False,
+                        error="plan_blocked",
+                        message=(
+                            f"Plan step {index} ({move}) was BLOCKED after "
+                            f"{executed} successful moves; aborted."
+                        ),
+                    ),
+                    frame_path,
+                )
+
+            updated = apply_move_to_level_map(self.level_map, move)
+            if updated is None:
+                return (
+                    ToolResult(
+                        ok=False,
+                        error="plan_diverged",
+                        message=(
+                            f"Plan step {index} ({move}) succeeded but the "
+                            "level map could not be updated; aborted."
+                        ),
+                    ),
+                    frame_path,
+                )
+            if updated != self.level_map:
+                self.level_map = updated
+                self.recorder.log_level_map(self.step_index, self.level_map)
+            executed += 1
+
+        return (
+            ToolResult(
+                ok=True,
+                message=(
+                    f"Executed {executed}/{len(moves)} planned moves. "
+                    "Call view_board to verify the result."
+                ),
+            ),
+            self.last_frame_path,
+        )
+
     def _execute_tool(
         self, call: ModelToolCall
     ) -> tuple[ToolResult, Path | None]:
@@ -672,6 +857,42 @@ class HarnessLoop:
                         f"{format_level_map(updated)}"
                     )
                 return ToolResult(ok=True, message=message), None
+
+            if call.name == "validate_solution":
+                if not self.level_map:
+                    raise ValueError(
+                        "Call level_map with rows before validate_solution."
+                    )
+                moves, max_steps, spike_mode = (
+                    parse_validate_solution_args(call.arguments)
+                )
+                outcome = validate_solution(
+                    self.level_map,
+                    moves,
+                    max_steps,
+                    spike_mode,
+                )
+                if not outcome.ok:
+                    return (
+                        ToolResult(
+                            ok=False,
+                            error="invalid_solution",
+                            message=outcome.reason,
+                        ),
+                        None,
+                    )
+                return (
+                    ToolResult(
+                        ok=True,
+                        message=(
+                            f"Solution valid: {outcome.steps} moves, "
+                            f"{outcome.cost}/{max_steps} will. Final position "
+                            f"r{outcome.player[0]}c{outcome.player[1]} is "
+                            "adjacent to the demon."
+                        ),
+                    ),
+                    None,
+                )
 
             if call.name == "view_board":
                 frame = self._capture()
@@ -710,52 +931,42 @@ class HarnessLoop:
                     self.last_frame_path,
                 )
 
-            key = MOVE_KEYS.get(call.name)
-            if key is not None:
-                self.input.key(key)
-                self.action_count += 1
-                self._pause()
+            if call.name in MOVE_KEYS:
+                return self._move(call.name)
+
+            if call.name == "toggle_map_overlay":
+                args = call.arguments if isinstance(call.arguments, dict) else {}
+                enabled = bool(args.get("enabled", True))
+                if enabled and not self.level_map:
+                    raise ValueError(
+                        "Call level_map with rows before enabling the "
+                        "map overlay."
+                    )
+                self.show_level_map_overlay = enabled
                 frame = self._capture()
-                # Detect whether the move actually changed the game state
-                # by comparing the new screenshot with the previous one.
-                blocked: bool | None = None
-                if self._prev_frame_png is not None:
-                    changed = _frames_differ(self._prev_frame_png, frame.png)
-                    blocked = not changed
-
-                # Record move in history (keep last 10)
-                self._move_history.append({
-                    "tool": call.name,
-                    "blocked": blocked,
-                })
-                if len(self._move_history) > 10:
-                    self._move_history = self._move_history[-10:]
-
-                # Build history summary for the message
-                history_str = self._format_history()
-
-                if blocked:
-                    message = (
-                        f"Move {key} was BLOCKED — no step consumed. "
-                        f"Do NOT repeat this move. Try a different direction "
-                        f"or call view_board to re-assess. "
-                        f"{history_str}"
-                    )
-                else:
-                    message = (
-                        f"Moved {key} one tile. Step consumed. "
-                        f"{history_str} "
-                        "Call view_board to see the result."
-                    )
+                state = "enabled" if enabled else "disabled"
                 return (
                     ToolResult(
                         ok=True,
-                        message=message,
-                        state_changed=not blocked if blocked is not None else True,
-                        blocked=blocked,
+                        message=(
+                            f"Map overlay {state}. Screenshot attached "
+                            f"({frame.width}x{frame.height})."
+                        ),
+                        image_png=frame.png,
                     ),
                     self.last_frame_path,
                 )
+
+            if call.name == "press_space":
+                self.input.key("space")
+                self.action_count += 1
+                return (
+                    ToolResult(ok=True, message="Pressed space."),
+                    None,
+                )
+
+            if call.name == "execute_plan":
+                return self._execute_plan(call)
 
             return (
                 ToolResult(
@@ -900,7 +1111,10 @@ class HarnessLoop:
         if result.image_png:
             result = replace(
                 result,
-                image_png=annotate_helltaker_grid(result.image_png),
+                image_png=annotate_helltaker_grid(
+                    result.image_png,
+                    self.level_map if self.show_level_map_overlay else None,
+                ),
             )
         map_updated = False
         if (

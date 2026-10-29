@@ -25,6 +25,14 @@ class LevelMapArgs(BaseModel):
     clear: bool = False
 
 
+class ValidateSolutionArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    moves: list[str] = Field(min_length=1, max_length=10_000)
+    max_steps: int = Field(ge=1, le=10_000)
+    spike_mode: str = Field(pattern="^(static|up|down)$")
+
+
 _MAX_LEVEL_MAP_ROWS = 64
 _MAX_LEVEL_MAP_COLS = 64
 _BRACKET_RE = re.compile(r"\[([^\[\]]+)\]")
@@ -100,6 +108,46 @@ def _level_map_schema() -> dict[str, Any]:
     }
 
 
+def _validate_solution_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "moves": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "move_up",
+                        "move_down",
+                        "move_left",
+                        "move_right",
+                    ],
+                },
+                "minItems": 1,
+                "description": "The proposed sequence of moves to validate.",
+            },
+            "max_steps": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10000,
+                "description": "The level's will/step limit.",
+            },
+            "spike_mode": {
+                "type": "string",
+                "enum": ["static", "up", "down"],
+                "description": (
+                    "static = spikes stay extended; up = start extended and "
+                    "alternate each move; down = start hidden and alternate "
+                    "each move. Hidden spikes cost 2 will. Alternating "
+                    "extended spikes cost 1 because they retract before entry."
+                ),
+            },
+        },
+        "required": ["moves", "max_steps", "spike_mode"],
+        "additionalProperties": False,
+    }
+
+
 def tool_schemas() -> list[dict[str, Any]]:
     """Return the tool definitions visible to the model."""
 
@@ -134,11 +182,51 @@ def tool_schemas() -> list[dict[str, Any]]:
             "level_map",
             "Create or update your own text map of the level. This does not "
             "change the game; it is a persistent scratchpad so you can model "
-            "walls and entity positions. Suggested symbols: X=wall/blocked, "
-            ".=open floor, H=Helltaker, S=skeleton, T=spike trap, D=demon, "
-            "R=rock, ?=unknown. Call it after moving or observing to keep the "
+            "walls and entity positions. Symbols: X=wall/blocked, .=open "
+            "floor, H=Helltaker, S=skeleton, T=spike trap, D=demon, R=rock, "
+            "K=key, B=barrier. Call it after moving or observing to keep the "
             "map current. All rows must have the same width.",
             _level_map_schema(),
+        ),
+        _tool(
+            "validate_solution",
+            "Validate a proposed move sequence against the current level_map. "
+            "This does not move the character. The sequence must reach a tile "
+            "adjacent to D, obey max_steps, and contain no blocked moves. "
+            "Stepping on K removes all B barriers. spike_mode controls "
+            "whether spikes stay extended or alternate.",
+            _validate_solution_schema(),
+        ),
+        _tool(
+            "execute_plan",
+            "Validate a move sequence and then execute it on the real game. "
+            "Only movement steps are allowed in a plan; press_space cannot be "
+            "part of one. Execution stops if a move is blocked or the level "
+            "map diverges.",
+            _validate_solution_schema(),
+        ),
+        _tool(
+            "press_space",
+            "Press the spacebar. Use this for dialogue, confirmations, and "
+            "menus. It is not a movement step and cannot be included in a "
+            "plan.",
+        ),
+        _tool(
+            "toggle_map_overlay",
+            "Show or hide the current level_map symbols on screenshots "
+            "returned to you. This helps revalidate map rows visually without "
+            "changing the game or the map. Requires a level_map when enabling.",
+            {
+                "type": "object",
+                "properties": {
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "True to show map markers, false to hide.",
+                    }
+                },
+                "required": ["enabled"],
+                "additionalProperties": False,
+            },
         ),
     ]
 
@@ -210,6 +298,8 @@ _SKELETON = "S"
 _ROCK = "R"
 _WALL = "X"
 _SPIKE = "T"
+_KEY = "K"
+_BARRIER = "B"
 
 
 def apply_move_to_level_map(
@@ -220,11 +310,12 @@ def apply_move_to_level_map(
 
     Rules:
     - empty destination: move H there and clear the old cell;
-    - skeleton: kick it one cell further, or remove it into a wall/rock;
+    - key: pick it up, remove it, and remove all barriers;
+    - skeleton: kick it one cell further, or remove it into an obstacle;
     - rock: push it one cell only when the next cell is empty or spikes.
 
-    Walls, unknown cells, spikes, demons, and out-of-bounds outcomes do not
-    change the map because the move should have been reported as blocked.
+    Walls, barriers, spikes, demons, and out-of-bounds outcomes do not change
+    the map because the move should have been reported as blocked.
     """
 
     if not rows:
@@ -243,16 +334,29 @@ def apply_move_to_level_map(
         return None
 
     destination = updated[row][col].upper()
-    if destination == _EMPTY:
+    if destination in {_EMPTY, _SPIKE}:
         updated[row][col] = _HELLTAKER
         updated[player_row][player_col] = _EMPTY
         return updated
+
+    if destination == _KEY:
+        updated[row][col] = _HELLTAKER
+        updated[player_row][player_col] = _EMPTY
+        for cells in updated:
+            for index, cell in enumerate(cells):
+                if cell.upper() == _BARRIER:
+                    cells[index] = _EMPTY
+        return updated
+
+    if destination == _BARRIER:
+        return None
 
     if destination == _SKELETON:
         next_row, next_col = row + delta[0], col + delta[1]
         if (
             not _inside(updated, next_row, next_col)
-            or updated[next_row][next_col].upper() in {_WALL, _ROCK}
+            or updated[next_row][next_col].upper()
+            in {_WALL, _ROCK, _BARRIER, _KEY}
         ):
             # The skeleton is destroyed against the obstacle.
             updated[row][col] = _HELLTAKER
@@ -290,6 +394,18 @@ def _find_symbol(
 
 def _inside(rows: list[list[str]], row: int, col: int) -> bool:
     return 0 <= row < len(rows) and 0 <= col < len(rows[row])
+
+
+def parse_validate_solution_args(
+    arguments: Any,
+) -> tuple[list[str], int, str]:
+    """Parse moves, max_steps, and spike_mode for validate_solution."""
+
+    try:
+        parsed = ValidateSolutionArgs.model_validate(_load_object(arguments))
+    except ValidationError as exc:
+        raise ValueError(_format_validation(exc)) from exc
+    return parsed.moves, parsed.max_steps, parsed.spike_mode
 
 
 def format_level_map(rows: list[list[str]]) -> str:
@@ -372,6 +488,10 @@ def _normalize_symbol(token: str) -> str:
         raise ValueError(
             "Level-map cells must be single non-space characters; "
             f"got {token!r}."
+        )
+    if symbol == "?":
+        raise ValueError(
+            "Level maps no longer support '?' cells; use only observed cells."
         )
     return symbol
 

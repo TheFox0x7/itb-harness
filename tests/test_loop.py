@@ -909,6 +909,165 @@ class LevelMapTests(unittest.TestCase):
             loop, result, pointer = run_loop(turns, Path(tmp))
             self.assertEqual(loop.level_map, [["X", ".", "X"], ["X", ".", "D"]])
 
+    def test_validate_solution_accepts_valid_plan(self) -> None:
+        turns = [
+            ModelTurn(
+                tool_calls=(
+                    call("level_map", {"rows": ["XD", "H."]}),
+                )
+            ),
+            ModelTurn(
+                tool_calls=(
+                    call(
+                        "validate_solution",
+                        {
+                            "moves": ["move_right"],
+                            "max_steps": 1,
+                            "spike_mode": "static",
+                        },
+                    ),
+                )
+            ),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            _loop, result, _pointer = run_loop(turns, Path(tmp))
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            self.assertEqual(records[1]["tool"], "validate_solution")
+            self.assertTrue(records[1]["ok"])
+            self.assertIn("Solution valid", records[1]["message"])
+            self.assertIn("adjacent to the demon", records[1]["message"])
+
+    def test_execute_plan_runs_moves_and_updates_map(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(
+                tool_calls=(
+                    call("level_map", {"rows": ["H.D"]}),
+                )
+            ),
+            ModelTurn(
+                tool_calls=(
+                    call(
+                        "execute_plan",
+                        {
+                            "moves": ["move_right"],
+                            "max_steps": 1,
+                            "spike_mode": "static",
+                        },
+                    ),
+                )
+            ),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = SequenceBackend([tiny_png(), different_png()])
+            backend.window = WINDOW
+            loop = HarnessLoop(
+                backend,
+                WINDOW,
+                ScriptedAgent(turns),
+                StubInput(),
+                LoopConfig(max_steps=10, action_delay=0, out_dir=Path(tmp)),
+            )
+            result = loop.run()
+            self.assertEqual(loop.action_count, 1)
+            self.assertEqual(loop.level_map, [[".", "H", "D"]])
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            self.assertEqual(records[2]["tool"], "execute_plan")
+            self.assertTrue(records[2]["ok"])
+            self.assertIn("Executed 1/1 planned moves", records[2]["message"])
+
+    def test_toggle_map_overlay_returns_marked_screenshot(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("level_map", {"rows": ["XHD"]}),)),
+            ModelTurn(
+                tool_calls=(
+                    call("toggle_map_overlay", {"enabled": True}),
+                )
+            ),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, _result, _pointer = run_loop(turns, Path(tmp))
+            self.assertTrue(loop.show_level_map_overlay)
+            messages = [
+                message
+                for message in loop.messages
+                if message.get("role") == "tool"
+                and message.get("name") == "toggle_map_overlay"
+            ]
+            self.assertEqual(len(messages), 1)
+            self.assertIsInstance(messages[0]["content"], list)
+            self.assertTrue(
+                any(
+                    part.get("type") == "image_url"
+                    for part in messages[0]["content"]
+                    if isinstance(part, dict)
+                )
+            )
+
+    def test_press_space_is_not_a_move(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("press_space"),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop, result, pointer = run_loop(turns, Path(tmp))
+            self.assertEqual(pointer.events, [InputEvent("key", key="space")])
+            self.assertEqual(result.frames, 0)
+            self.assertEqual(loop.action_count, 1)
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            self.assertEqual(records[0]["tool"], "press_space")
+            self.assertIn("Pressed space", records[0]["message"])
+
+    def test_validate_solution_rejects_blocked_plan(self) -> None:
+        turns = [
+            ModelTurn(
+                tool_calls=(
+                    call("level_map", {"rows": ["HXD"]}),
+                )
+            ),
+            ModelTurn(
+                tool_calls=(
+                    call(
+                        "validate_solution",
+                        {
+                            "moves": ["move_right"],
+                            "max_steps": 1,
+                            "spike_mode": "static",
+                        },
+                    ),
+                )
+            ),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            _loop, result, _pointer = run_loop(turns, Path(tmp))
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            self.assertEqual(records[1]["error"], "invalid_solution")
+            self.assertIn("wall", records[1]["message"])
+
     def test_successful_move_updates_level_map(self) -> None:
         turns = [
             ModelTurn(tool_calls=(call("view_board"),)),

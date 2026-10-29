@@ -522,7 +522,8 @@ function drawLevelMapAnnotations(ctx, width, height, bottom) {
     D: "#ff8df0",
     R: "#ffb3c7",
     X: "#9aa7b4",
-    "?": "#ffd166",
+    K: "#ffd166",
+    B: "#ff9f43",
   };
 
   ctx.save();

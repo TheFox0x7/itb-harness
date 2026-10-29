@@ -11,7 +11,7 @@ from __future__ import annotations
 from io import BytesIO
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 
 CELL_WIDTH = 68
@@ -21,6 +21,17 @@ MIN_RED_RUN = CELL_WIDTH
 
 # Same filter as the web viewer grid in web/static/app.js.
 _FLOOR_RED = (120, 220, 255, 97)
+_MAP_COLORS = {
+    "H": (126, 240, 255, 255),
+    "S": (242, 242, 242, 255),
+    "T": (255, 107, 95, 255),
+    "D": (255, 141, 240, 255),
+    "R": (255, 179, 199, 255),
+    "X": (154, 167, 180, 255),
+    "K": (255, 209, 102, 255),
+    "B": (255, 159, 67, 255),
+}
+_MAP_DEFAULT_COLOR = (255, 209, 102, 255)
 
 
 def red_floor_mask(arr: np.ndarray) -> np.ndarray:
@@ -56,8 +67,85 @@ def find_floor_anchor(mask: np.ndarray) -> int | None:
     return None
 
 
-def annotate_helltaker_grid(png: bytes) -> bytes:
-    """Return a PNG with the anchored Helltaker grid drawn on top."""
+def _draw_level_map(
+    draw: ImageDraw.ImageDraw,
+    rows: list[list[str]],
+    *,
+    width: int,
+    height: int,
+    bottom: int,
+) -> None:
+    columns = max(
+        (len(row) for row in rows if isinstance(row, list)),
+        default=0,
+    )
+    if not columns or not rows:
+        return
+
+    left = width / 2.0 - (columns * CELL_WIDTH) / 2.0
+    font = ImageFont.load_default(size=20)
+
+    for row_index, cells in enumerate(rows):
+        if not isinstance(cells, list):
+            continue
+        for col_index, value in enumerate(cells):
+            symbol = str(value).strip()
+            if not symbol:
+                continue
+            x = int(
+                round(
+                    left
+                    + col_index * CELL_WIDTH
+                    + CELL_WIDTH / 2.0
+                )
+            )
+            y = int(
+                round(
+                    bottom
+                    - (len(rows) - 1 - row_index) * CELL_HEIGHT
+                    - CELL_HEIGHT / 2.0
+                )
+            )
+            if not (0 <= x < width and 0 <= y < height):
+                continue
+
+            if symbol == ".":
+                draw.ellipse(
+                    [x - 3, y - 3, x + 3, y + 3],
+                    fill=(220, 230, 240, 128),
+                )
+                continue
+
+            bbox = draw.textbbox((0, 0), symbol, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+            draw.rectangle(
+                [
+                    x - text_width // 2 - 5,
+                    y - text_height // 2 - 3,
+                    x + text_width // 2 + 5,
+                    y + text_height // 2 + 3,
+                ],
+                fill=(8, 12, 16, 184),
+            )
+            draw.text(
+                (x, y),
+                symbol,
+                fill=_MAP_COLORS.get(symbol, _MAP_DEFAULT_COLOR),
+                font=font,
+                anchor="mm",
+            )
+
+
+def annotate_helltaker_grid(
+    png: bytes,
+    level_map: list[list[str]] | None = None,
+) -> bytes:
+    """Return a PNG with the anchored Helltaker grid drawn on top.
+
+    When ``level_map`` is provided, its symbols are drawn into the matching
+    grid cells.
+    """
 
     image = Image.open(BytesIO(png)).convert("RGB")
     width, height = image.size
@@ -84,6 +172,15 @@ def annotate_helltaker_grid(png: bytes) -> bytes:
             [(max(0, int(round(left))), y), (min(width - 1, int(round(right))), y)],
             fill=_FLOOR_RED,
             width=1,
+        )
+
+    if level_map:
+        _draw_level_map(
+            draw,
+            level_map,
+            width=width,
+            height=height,
+            bottom=bottom,
         )
 
     image = Image.alpha_composite(image.convert("RGBA"), overlay)

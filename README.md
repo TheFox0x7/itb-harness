@@ -144,9 +144,9 @@ least one cell-width of continuous red floor pixels (`#8c1c31` / `#700c29`).
 Rows propagate upward from that anchor, so the top row is partial when the
 anchored height is not a multiple of 72 px. The web overlay also draws the
 current `level_map` symbols into the matching grid cells, centered horizontally
-and bottom-aligned. Those annotations are viewer-only and are not sent to the
-model. The grid lines themselves are drawn onto screenshots returned to the
-model; saved raw frames remain unmodified.
+and bottom-aligned. Grid lines are always drawn onto screenshots returned to
+the model; map-symbol annotations are optional there and enabled with
+`toggle_map_overlay`. Saved raw frames remain unmodified.
 
 Steering is cooperative: the message is added to the model conversation at
 the start of the next turn, not sent as an immediate key press. If the session
@@ -200,6 +200,10 @@ The model is not given an automatic screenshot. It has exactly these tools:
 | `move_right` | — | Press Right and move one tile |
 | `reset_level` | — | Press `R` to restart the current level and clear the level map |
 | `level_map` | `rows`, `updates`, or `clear` | Store the model's own text grid of the level |
+| `validate_solution` | `moves`, `max_steps`, `spike_mode` | Replay a proposed move list against the current map |
+| `execute_plan` | `moves`, `max_steps`, `spike_mode` | Validate and then execute the plan on the game |
+| `press_space` | — | Press spacebar for dialogue/confirmations; never part of a plan |
+| `toggle_map_overlay` | `enabled` bool | Show or hide the model's map symbols on its screenshots |
 
 Movement tools capture a fresh frame for blocked-move detection and replay, but
 do not return a screenshot to the model. Call `view_board` when you need to see
@@ -220,8 +224,30 @@ with the game. It is also shown in the web UI sidebar for both live runs and
 replays, and its symbols are drawn onto the web grid overlay. On successful
 moves the harness updates the map automatically: `H` advances, skeletons are
 kicked one cell and destroyed against walls/rocks, and rocks are pushed only
-into empty or spike cells. Blocked moves leave it unchanged. `reset_level`
-clears it.
+into empty or spike cells. Blocked moves leave it unchanged. Use
+`toggle_map_overlay` to draw the map symbols onto model screenshots for visual
+row validation. `reset_level` clears it.
+
+`validate_solution` replays a proposed move list against the current map. It
+does not move the character. Validation succeeds only when every move is legal,
+the total will cost is within `max_steps`, and `H` finishes on a tile adjacent
+to `D`. Moving onto `D` itself, walls, out-of-bounds cells, or an immovable
+rock fails validation. Rocks can be pushed into empty cells or spikes, and
+skeletons are kicked one cell forward or destroyed against walls/rocks.
+Stepping on a key (`K`) removes it and every barrier (`B`); moving into a
+barrier while any remain fails validation like a wall.
+
+`spike_mode` is `static` (spikes stay extended), `up` (start extended and
+alternate each move), or `down` (start hidden and alternate each move). Hidden
+spikes cost 2 will total. An alternating spike that is currently extended
+costs only the normal move, because it retracts before the player enters the
+tile. Static extended spikes cost 2 will. The validator rejects maps containing
+`?`, since every tile should be observed.
+
+`execute_plan` revalidates the same arguments, then plays the moves one at a
+time. It aborts on a blocked move or if the level map cannot be updated. Keys
+and barriers update the map during execution. `press_space` is a separate
+dialogue/confirm action; only `move_*` entries are accepted in plans.
 
 At the start of the conversation the model also receives reference crops for
 extended spikes, hidden spikes, and rocks from
