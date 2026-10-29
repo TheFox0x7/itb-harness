@@ -1,0 +1,80 @@
+version: '3'
+
+# Launch every mode of the harness without digging through the README.
+#   task --list                      see everything
+#   task agent WINDOW=Helltaker BACKEND=x11 INPUT=x11 STEPS=30
+# Extra flags pass straight through, e.g. `task replay CLI_ARGS="--port 9000"`.
+
+tasks:
+  default:
+    desc: List all tasks
+    cmds:
+      - task --list
+
+  # --- capture -----------------------------------------------------------
+
+  capture:
+    desc: Interactive capture REPL (itb-harness)
+    cmds:
+      - uv run itb-harness {{.CLI_ARGS}}
+
+  capture:list:
+    desc: List capturable windows and exit
+    cmds:
+      - uv run itb-harness --list {{.CLI_ARGS}}
+
+  capture:once:
+    desc: Capture a single frame of WINDOW (default Helltaker) into runs/
+    cmds:
+      - uv run itb-harness --backend {{.BACKEND | default "auto"}} --window {{.WINDOW | default "Helltaker"}} --once --out runs {{.CLI_ARGS}}
+
+  # --- agent -------------------------------------------------------------
+  # Needs MISTRAL_API_KEY in the environment. For real key presses use
+  # INPUT=x11 and run inside the game's display, e.g. DISPLAY=:2 from
+  # gamescope (see `task game`).
+
+  agent:
+    desc: Headless agent loop (itb-agent), STEPS turns max (default 20)
+    cmds:
+      - uv run itb-agent --backend {{.BACKEND | default "auto"}} --window {{.WINDOW | default "Helltaker"}} --input {{.INPUT | default "stub"}} --steps {{.STEPS | default "20"}} {{.CLI_ARGS}}
+
+  live:
+    desc: Agent with the interactive browser UI (itb-agent --web), http://127.0.0.1:{{.PORT | default "8000"}}
+    cmds:
+      - uv run itb-agent --web --backend {{.BACKEND | default "auto"}} --window {{.WINDOW | default "Helltaker"}} --input {{.INPUT | default "stub"}} --port {{.PORT | default "8000"}} {{.CLI_ARGS}}
+
+  # --- replay ------------------------------------------------------------
+
+  replay:
+    desc: Read-only replay viewer for recorded runs (itb-web), http://127.0.0.1:{{.PORT | default "8000"}}
+    cmds:
+      - uv run itb-web --runs {{.RUNS | default "runs"}} --port {{.PORT | default "8000"}} {{.CLI_ARGS}}
+
+  # --- game --------------------------------------------------------------
+
+  game:
+    desc: Run the game under gamescope (GAME=path to binary, default ./Helltaker)
+    cmds:
+      - gamescope -W 1920 -H 1080 -w 1920 -h 1080 -- {{.GAME | default "./Helltaker"}}
+
+  # --- dev ---------------------------------------------------------------
+
+  sync:
+    desc: Sync dependencies (EXTRA=kde or EXTRA=x11 for a capture backend)
+    cmds:
+      - uv sync {{if .EXTRA}}--extra {{.EXTRA}}{{end}} {{.CLI_ARGS}}
+
+  test:
+    desc: Run the test suite
+    cmds:
+      - uv run --with pytest pytest {{.CLI_ARGS}}
+
+  lint:
+    desc: Ruff check
+    cmds:
+      - uvx ruff check {{.CLI_ARGS}}
+
+  fmt:
+    desc: Ruff format
+    cmds:
+      - uvx ruff format {{.CLI_ARGS}}

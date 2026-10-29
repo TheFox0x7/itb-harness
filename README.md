@@ -4,6 +4,19 @@ Prototype LLM game harness for **Helltaker**. Pick the game window once per
 session, capture its client area, and let the model observe screenshots and
 move with arrow-key tools.
 
+## Branches
+
+Every branch below forks from `main` (at `508c901`) and represents a different
+approach shift that might be of interest:
+
+| Branch | Approach |
+|---|---|
+| `main` | Base harness: window capture (KDE/KWin Wayland and generic X11), the replay viewer, the live web UI, and the tool-based agent loop documented below. |
+| `helltaker` | Helltaker-specific iteration: game-change tests, steering and helper tools (frame annotation, board overlay), and capture/session utilities. |
+| `helltaker-mcp` | `helltaker` plus swapping the in-process tool loop for an MCP server (`src/itb_mcp/`) exposing game state, frame diffs, overlays, prompts, and run recording, along with a Vibe skill (`vibe/skills/helltaker/`) that plays through the server. |
+| `responses` | `helltaker` plus moving the agent adapter to Mistral's Responses API (`client.responses.create`), dropping bounding-box click tools in favor of a grid overlay and a model-maintained `level_map`. |
+| `planner` | `responses` plus a plan-then-execute approach: `validate_solution` / `execute_plan` replay a proposed move list against the level map (`src/itb_harness/validator.py`) before touching the game, and reference crops of terrain and items are sent with the first turn. |
+
 ## Current backends
 
 - **KDE Plasma 6 / KWin Wayland** via [`kwcapture`](https://pypi.org/project/kwcapture/),
@@ -23,6 +36,32 @@ uv sync --extra x11   # generic X11 / gamescope backend
 Both are optional extras because they are platform-specific. The rest of the
 harness only depends on the backend interface in
 `src/itb_harness/capture/base.py`.
+
+## Taskfile
+
+A [Taskfile.yml](Taskfile.yml) wraps every mode so you don't have to dig
+through this README. Run `task --list` (binary: `task` or `go-task`) to see
+all of them:
+
+```bash
+task capture            # interactive capture REPL (itb-harness)
+task capture:list       # list capturable windows
+task capture:once       # one frame of WINDOW=Helltaker into runs/
+task agent              # headless agent loop (itb-agent)
+task live               # agent with the browser UI (itb-agent --web)
+task replay             # read-only replay viewer (itb-web)
+task game               # Helltaker under gamescope
+task sync EXTRA=kde     # install deps (EXTRA=kde or x11)
+task test               # pytest
+task lint               # ruff check
+```
+
+Variables override the defaults, extra flags pass through with `CLI_ARGS`:
+
+```bash
+task live BACKEND=x11 WINDOW=Helltaker INPUT=x11 PORT=9000
+task agent STEPS=30 CLI_ARGS="--max-images 0"
+```
 
 ## gamescope
 
