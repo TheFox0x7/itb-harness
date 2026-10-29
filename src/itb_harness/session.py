@@ -26,6 +26,8 @@ class SteppableLoop(Protocol):
 
     def add_guidance(self, text: str) -> bool: ...
 
+    def reset(self) -> None: ...
+
     def close(self) -> None: ...
 
 
@@ -135,29 +137,54 @@ class SessionRunner:
         self._emit_status()
         return True
 
-    def set_overlay(self, name: str, enabled: bool) -> bool:
-        """Toggle a board overlay (grid or walkability) on the live loop."""
-        with self._lock:
-            if self.state in {"stopped", "stopping", "error"}:
+    def reset(self) -> bool:
+        """Clear the conversation and start a fresh run without a restart."""
+
+        with self._cv:
+            if self._busy or self.state in {"running", "stopping"}:
                 return False
-            loop = self.loop
-        if name == "grid":
-            loop._show_grid = enabled
-        elif name == "walkability":
-            loop._show_walkability = enabled
-        else:
-            return False
-        # Capture a fresh frame with the new overlay state so the
-        # next view_board / movement tool shows it immediately.
-        try:
-            loop._capture()
-        except Exception:
-            pass
-        self._broadcast({
-            "type": "overlay",
-            "name": name,
-            "enabled": enabled,
-        })
+            thread = self._thread
+            terminal = self.state in {"stopped", "error"}
+
+        # A terminal worker exits after it closes its recorder.  Wait for it
+        # so reset cannot swap the recorder out from under that teardown.
+        if terminal and thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                return False
+
+        with self._cv:
+            if self._busy or self.state in {"running", "stopping"}:
+                return False
+            old_run_id = self.run_id
+            self.loop.reset()
+            self.run_id = self.loop.recorder.root.name
+            self.auto = False
+            self.state = "paused"
+            self.phase = "idle"
+            self.error = None
+            self.reason = None
+            self.thinking = ""
+            self.content = ""
+            self.first_token_ms = None
+            self._model_started = None
+            self._last_activity = time.monotonic()
+            self._step_requested = False
+            self._stop_requested = False
+            self._closed = False
+            if self._thread is not None and not self._thread.is_alive():
+                self._thread = None
+
+        self._broadcast(
+            {
+                "type": "reset",
+                "run_id": self.run_id,
+                "previous_run_id": old_run_id,
+                "level_map": self.loop.level_map,
+            }
+        )
+        self.start()
+        self._emit_status()
         return True
 
     def join(self, timeout: float | None = None) -> None:
@@ -185,15 +212,12 @@ class SessionRunner:
                 ),
                 "thinking": self.thinking,
                 "content": self.content,
+                "level_map": getattr(self.loop, "level_map", None),
                 "error": self.error,
                 "reason": self.reason,
                 "thread_alive": bool(
                     self._thread is not None and self._thread.is_alive()
                 ),
-                "overlays": {
-                    "grid": getattr(self.loop, "_show_grid", False),
-                    "walkability": getattr(self.loop, "_show_walkability", False),
-                },
             }
 
     # ------------------------------------------------------------------

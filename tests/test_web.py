@@ -122,6 +122,28 @@ class ReplayLoaderTests(unittest.TestCase):
             self.assertEqual(hover["marker_frames"], ["0002.png"])
             self.assertFalse(hover["with_details"])
 
+    def test_load_run_exposes_level_map_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = self.make_run(root)
+            (run / "level_map.jsonl").write_text(
+                json.dumps(
+                    {
+                        "step": 1,
+                        "rows": [["X", "X", "X"], ["X", "H", "D"]],
+                    }
+                )
+                + "\n"
+                + json.dumps({"step": 3, "rows": None})
+                + "\n"
+            )
+            loaded = load_run(run)
+            expected = [["X", "X", "X"], ["X", "H", "D"]]
+            self.assertEqual(loaded["turns"][0]["level_map"], expected)
+            self.assertEqual(loaded["turns"][1]["level_map"], expected)
+            self.assertIsNone(loaded["turns"][2]["level_map"])
+            self.assertIsNone(loaded["level_map"])
+
     def test_list_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

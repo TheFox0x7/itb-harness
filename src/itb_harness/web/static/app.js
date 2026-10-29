@@ -1,8 +1,15 @@
+const GRID_CELL_W = 68;
+const GRID_CELL_H = 72;
+const GRID_COLUMNS = 9;
+
 const state = {
   runs: [],
   run: null,
   frameIndex: 0,
   showMarkers: true,
+  showGrid: true,
+  gridAnchors: new Map(),
+  currentLevelMap: null,
   coordMode: "pixels",
   timelineRunId: null,
   timelineSignature: "",
@@ -38,6 +45,11 @@ async function fetchJSON(url) {
   return response.json();
 }
 
+async function refreshRuns() {
+  state.runs = await fetchJSON("/api/runs");
+  renderRunSelect();
+}
+
 function frameName(index) {
   return state.run?.frames?.[index] ?? null;
 }
@@ -55,24 +67,6 @@ function normalizeArgs(args) {
   }
 }
 
-function formatBoxes(boxes) {
-  if (!Array.isArray(boxes)) {
-    return `boxes: ${JSON.stringify(boxes)}`;
-  }
-  if (!boxes.length) return "0 boxes";
-  return boxes
-    .map((box) => {
-      if (!box || typeof box !== "object") return String(box);
-      const coords = Array.isArray(box.box_2d)
-        ? `[${box.box_2d.join(", ")}]`
-        : "[?]";
-      const label =
-        typeof box.label === "string" ? box.label : "?";
-      return `${label} ${coords}`;
-    })
-    .join("; ");
-}
-
 function formatArgs(rawArgs) {
   const args = normalizeArgs(rawArgs);
   if (typeof args === "string") return args;
@@ -82,7 +76,6 @@ function formatArgs(rawArgs) {
     const suffix = args.with_details ? " +details" : "";
     return `(${point[0]}, ${point[1]})${suffix}`;
   }
-  if ("boxes" in args) return formatBoxes(args.boxes);
   if (typeof args.steps !== "undefined") return `×${args.steps}`;
   if (typeof args.number !== "undefined") return `#${args.number}`;
   if (typeof args.text === "string") {
@@ -111,6 +104,58 @@ function renderMeta() {
   if (meta.input) bits.push(`input ${meta.input}`);
   $("#meta").textContent = bits.join("  ·  ");
   $("#turn-count").textContent = `${state.run?.turns?.length ?? 0} turns · ${state.run?.frames?.length ?? 0} frames`;
+}
+
+function latestLevelMap(run) {
+  const turns = run?.turns ?? [];
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    if (Object.prototype.hasOwnProperty.call(turns[index], "level_map")) {
+      return turns[index].level_map;
+    }
+  }
+  return null;
+}
+
+function renderLevelMap(rows) {
+  const panel = $("#level-map-panel");
+  const node = $("#level-map");
+  const meta = $("#level-map-meta");
+  if (!panel || !node || !meta) return;
+
+  if (!Array.isArray(rows) || !rows.length) {
+    state.currentLevelMap = null;
+    panel.hidden = true;
+    node.textContent = "";
+    meta.textContent = "";
+    drawMarkers();
+    return;
+  }
+
+  state.currentLevelMap = rows;
+  const width = Array.isArray(rows[0]) ? rows[0].length : 0;
+  node.textContent = rows
+    .map((row) => (Array.isArray(row) ? row.map((cell) => `[${cell}]`).join(" ") : ""))
+    .join("\n");
+  meta.textContent = `${rows.length} × ${width}`;
+  panel.hidden = false;
+  drawMarkers();
+}
+
+function renderCurrentLevelMap() {
+  const live = state.live;
+  const viewingLive =
+    state.followLive &&
+    live?.active &&
+    live.run_id &&
+    state.run?.id === live.run_id;
+  if (
+    viewingLive &&
+    Object.prototype.hasOwnProperty.call(live, "level_map")
+  ) {
+    renderLevelMap(live.level_map);
+    return;
+  }
+  renderLevelMap(latestLevelMap(state.run));
 }
 
 function renderRunSelect() {
@@ -229,14 +274,6 @@ function renderTimeline(options = {}) {
         if (args) {
           const argsNode = el("span", "action-args", args);
           argsNode.title = args;
-          const normalized = normalizeArgs(action.arguments);
-          if (
-            normalized &&
-            typeof normalized === "object" &&
-            "boxes" in normalized
-          ) {
-            argsNode.classList.add("boxes");
-          }
           line.append(argsNode);
         }
         if (!action.ok) line.append(el("span", "badge", action.error || "error"));
@@ -366,6 +403,169 @@ function drawCrosshair(ctx) {
   );
 }
 
+function isRedFloor(r, g, b) {
+  // Covers the Helltaker floor reds around #8c1c31 and #700c29.
+  return (
+    r >= 80 &&
+    r <= 200 &&
+    g <= 80 &&
+    b <= 110 &&
+    r - g >= 45 &&
+    r - b >= 30
+  );
+}
+
+function gridAnchorKey() {
+  return `${state.run?.id ?? ""}/${frameName(state.frameIndex) ?? ""}`;
+}
+
+function detectGridBottom(image) {
+  const width = image.naturalWidth;
+  const height = image.naturalHeight;
+  if (!width || !height) return height;
+
+  const sample = document.createElement("canvas");
+  sample.width = width;
+  sample.height = height;
+  const ctx = sample.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return height;
+  ctx.drawImage(image, 0, 0);
+
+  let pixels;
+  try {
+    pixels = ctx.getImageData(0, 0, width, height).data;
+  } catch (error) {
+    return height;
+  }
+
+  // Scan upward for the first row containing at least one cell-width of
+  // continuous floor red. That row is the bottom edge of the board.
+  for (let y = height - 1; y >= 0; y -= 1) {
+    let run = 0;
+    let offset = y * width * 4;
+    for (let x = 0; x < width; x += 1, offset += 4) {
+      if (isRedFloor(pixels[offset], pixels[offset + 1], pixels[offset + 2])) {
+        run += 1;
+        if (run >= GRID_CELL_W) return y + 1;
+      } else {
+        run = 0;
+      }
+    }
+  }
+
+  return height;
+}
+
+function gridBottom() {
+  const key = gridAnchorKey();
+  if (state.gridAnchors.has(key)) return state.gridAnchors.get(key);
+
+  const image = $("#frame-img");
+  if (!image.naturalWidth || !image.naturalHeight) return null;
+  const bottom = detectGridBottom(image);
+  state.gridAnchors.set(key, bottom);
+  return bottom;
+}
+
+function drawGrid(ctx) {
+  const width = ctx.canvas.width;
+  const height = ctx.canvas.height;
+  const bottom = gridBottom();
+  if (bottom == null) return;
+
+  const left = width / 2 - (GRID_COLUMNS * GRID_CELL_W) / 2;
+  const right = left + GRID_COLUMNS * GRID_CELL_W;
+
+  ctx.save();
+  ctx.strokeStyle = "rgba(120, 220, 255, 0.38)";
+  ctx.lineWidth = 1;
+
+  for (let col = 0; col <= GRID_COLUMNS; col += 1) {
+    const x = Math.round(left + col * GRID_CELL_W) + 0.5;
+    if (x < 0 || x > width) continue;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, Math.min(height, bottom));
+    ctx.stroke();
+  }
+
+  // Anchor the bottom row to the first red floor row and propagate upward.
+  // The top row is partial when the anchored height is not a multiple of 72.
+  for (let y = bottom; y >= 0; y -= GRID_CELL_H) {
+    const yy = Math.round(y) + 0.5;
+    ctx.beginPath();
+    ctx.moveTo(Math.max(0, left), yy);
+    ctx.lineTo(Math.min(width, right), yy);
+    ctx.stroke();
+  }
+
+  drawLevelMapAnnotations(ctx, width, height, bottom);
+
+  ctx.restore();
+}
+
+function drawLevelMapAnnotations(ctx, width, height, bottom) {
+  const rows = state.currentLevelMap;
+  if (!Array.isArray(rows) || !rows.length) return;
+
+  const columns = Math.max(
+    ...rows.map((row) => (Array.isArray(row) ? row.length : 0))
+  );
+  if (!columns) return;
+
+  const left = width / 2 - (columns * GRID_CELL_W) / 2;
+  const fontSize = Math.max(12, Math.round(GRID_CELL_H * 0.3));
+  const colors = {
+    H: "#7ef0ff",
+    S: "#f2f2f2",
+    T: "#ff6b5f",
+    D: "#ff8df0",
+    R: "#ffb3c7",
+    X: "#9aa7b4",
+    "?": "#ffd166",
+  };
+
+  ctx.save();
+  ctx.font = `700 ${fontSize}px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  for (let row = 0; row < rows.length; row += 1) {
+    const cells = Array.isArray(rows[row]) ? rows[row] : [];
+    for (let col = 0; col < cells.length; col += 1) {
+      const symbol = String(cells[col] ?? "").trim();
+      if (!symbol) continue;
+
+      const x = left + col * GRID_CELL_W + GRID_CELL_W / 2;
+      const y =
+        bottom - (rows.length - 1 - row) * GRID_CELL_H - GRID_CELL_H / 2;
+      if (x < 0 || x > width || y < 0 || y > height) continue;
+
+      if (symbol === ".") {
+        ctx.fillStyle = "rgba(220, 230, 240, 0.5)";
+        ctx.beginPath();
+        ctx.arc(x, y, 3, 0, Math.PI * 2);
+        ctx.fill();
+        continue;
+      }
+
+      const color = colors[symbol] ?? "#ffd166";
+      const textWidth = ctx.measureText(symbol).width;
+      ctx.fillStyle = "rgba(8, 12, 16, 0.72)";
+      ctx.fillRect(
+        x - textWidth / 2 - 5,
+        y - fontSize / 2 - 3,
+        textWidth + 10,
+        fontSize + 6
+      );
+      ctx.fillStyle = color;
+      ctx.fillText(symbol, x, y);
+    }
+  }
+
+  ctx.restore();
+}
+
 function drawMarkers() {
   const canvas = $("#overlay");
   const ctx = canvas.getContext("2d");
@@ -374,6 +574,8 @@ function drawMarkers() {
 
   const name = frameName(state.frameIndex);
   if (!name) return;
+
+  if (state.showGrid) drawGrid(ctx);
 
   if (state.showMarkers) {
     const radius = Math.max(10, canvas.width * 0.006);
@@ -569,6 +771,7 @@ async function loadRun(runId, options = {}) {
   const wasAtBottom =
     timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 40;
   if (!sameRun) {
+    state.gridAnchors.clear();
     timeline.replaceChildren(el("div", "muted", "Loading…"));
   }
   const run = await fetchJSON(`/api/runs/${encodeURIComponent(runId)}`);
@@ -588,6 +791,7 @@ async function loadRun(runId, options = {}) {
   }
 
   renderMeta();
+  renderCurrentLevelMap();
   const signature = timelineSignature(run);
   if (!sameRun || signature !== state.timelineSignature) {
     renderTimeline({
@@ -655,18 +859,8 @@ function updateLiveControls(live) {
   $("#live-stop").disabled = ["stopped", "stopping", "error"].includes(
     stateName
   );
-  // Update overlay toggle button states
-  const overlays = live.overlays ?? {};
-  const gridBtn = $("#overlay-grid");
-  const walkBtn = $("#overlay-walkability");
-  if (gridBtn) {
-    gridBtn.classList.toggle("active", !!overlays.grid);
-    gridBtn.disabled = ["stopped", "stopping", "error"].includes(stateName);
-  }
-  if (walkBtn) {
-    walkBtn.classList.toggle("active", !!overlays.walkability);
-    walkBtn.disabled = ["stopped", "stopping", "error"].includes(stateName);
-  }
+  $("#live-reset").disabled =
+    !!live.busy || !["paused", "stopped", "error"].includes(stateName);
 }
 
 function updateLiveActivity() {
@@ -820,6 +1014,29 @@ function handleLiveEvent(event) {
     return;
   }
 
+  if (type === "reset") {
+    state.live = {
+      ...(state.live ?? {}),
+      active: true,
+      state: "paused",
+      phase: "idle",
+      run_id: event.run_id,
+      steps: 0,
+      actions: 0,
+      frames: 0,
+      level_map: event.level_map ?? null,
+      error: null,
+      reason: null,
+    };
+    state.liveEnded = false;
+    state.livePhase = "idle";
+    liveResetThinking();
+    updateLiveControls(state.live);
+    renderCurrentLevelMap();
+    requestLiveRunRefresh();
+    return;
+  }
+
   if (type === "error") {
     state.live = {
       ...(state.live ?? {}),
@@ -888,6 +1105,7 @@ async function pollLive() {
     const live = await fetchJSON("/api/live");
     state.live = live;
     updateLiveControls(live);
+    renderCurrentLevelMap();
 
     if (!live?.active) {
       if (state.liveSource) {
@@ -896,7 +1114,7 @@ async function pollLive() {
       }
       return;
     }
-    if (liveIsTerminal(live)) state.liveEnded = true;
+    state.liveEnded = liveIsTerminal(live);
     state.livePhase = live.phase ?? state.livePhase;
     if (live.last_activity_age_ms != null) {
       state.liveActivityAt = Date.now() - live.last_activity_age_ms;
@@ -939,6 +1157,11 @@ async function liveCommand(command) {
       updateLiveControls(state.live);
     }
     await fetch(`/api/live/${command}`, { method: "POST" });
+    if (command === "reset") {
+      state.liveEnded = false;
+      liveResetThinking();
+      await refreshRuns();
+    }
     await pollLive();
     setTimeout(pollLive, 250);
   } catch (error) {
@@ -1037,34 +1260,7 @@ $("#live-step").addEventListener("click", () => liveCommand("step"));
 $("#live-resume").addEventListener("click", () => liveCommand("resume"));
 $("#live-pause").addEventListener("click", () => liveCommand("pause"));
 $("#live-stop").addEventListener("click", () => liveCommand("stop"));
-
-async function toggleOverlay(name) {
-  const btn = $(`#overlay-${name}`);
-  if (!btn) return;
-  const currentlyActive = btn.classList.contains("active");
-  const enabled = !currentlyActive;
-  try {
-    const response = await fetch("/api/live/overlay", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, enabled }),
-    });
-    const data = await response.json();
-    if (!response.ok || !data.ok) {
-      throw new Error(data.detail || "overlay toggle failed");
-    }
-    btn.classList.toggle("active", enabled);
-    // Refresh the run to pick up the new frame with overlay
-    if (state.live?.run_id) {
-      await loadRun(state.live.run_id);
-    }
-  } catch (error) {
-    $("#live-error").textContent = `overlay failed: ${error}`;
-  }
-}
-
-$("#overlay-grid")?.addEventListener("click", () => toggleOverlay("grid"));
-$("#overlay-walkability")?.addEventListener("click", () => toggleOverlay("walkability"));
+$("#live-reset").addEventListener("click", () => liveCommand("reset"));
 
 $("#prev-frame").addEventListener("click", () => showFrame(state.frameIndex - 1));
 $("#next-frame").addEventListener("click", () => showFrame(state.frameIndex + 1));
@@ -1072,6 +1268,11 @@ $("#next-frame").addEventListener("click", () => showFrame(state.frameIndex + 1)
 $("#coord-normalized").addEventListener("change", (event) => {
   state.coordMode = event.target.checked ? "normalized" : "pixels";
   updateCoordReadout();
+  drawMarkers();
+});
+
+$("#show-grid").addEventListener("change", (event) => {
+  state.showGrid = event.target.checked;
   drawMarkers();
 });
 

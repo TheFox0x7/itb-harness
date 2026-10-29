@@ -130,10 +130,23 @@ Controls:
 - **Resume** — run continuously until paused or stopped
 - **Pause** — finish the current step, then pause
 - **Stop** — stop after the current step (an in-flight model request may finish)
+- **Reset** — clear the model conversation and counters, then start a fresh run
+  directory without restarting the server
 - **follow** — keep the browser on the live run and latest frame
 - **steer** — queue a guidance message for the model's next turn
 
 There is no predetermined step count in web mode; `--steps` is ignored.
+
+The frame toolbar has a **grid** toggle. It draws a viewer overlay with 68×72
+px cells: nine columns centered horizontally. The bottom of the grid is anchored
+to the first row, scanning upward from the bottom of the image, that contains at
+least one cell-width of continuous red floor pixels (`#8c1c31` / `#700c29`).
+Rows propagate upward from that anchor, so the top row is partial when the
+anchored height is not a multiple of 72 px. The web overlay also draws the
+current `level_map` symbols into the matching grid cells, centered horizontally
+and bottom-aligned. Those annotations are viewer-only and are not sent to the
+model. The grid lines themselves are drawn onto screenshots returned to the
+model; saved raw frames remain unmodified.
 
 Steering is cooperative: the message is added to the model conversation at
 the start of the next turn, not sent as an immediate key press. If the session
@@ -185,31 +198,34 @@ The model is not given an automatic screenshot. It has exactly these tools:
 | `move_down` | — | Press Down and move one tile |
 | `move_left` | — | Press Left and move one tile |
 | `move_right` | — | Press Right and move one tile |
-| `reset_level` | — | Press `R` to restart the current level and clear the box overlay |
-| `set_boxes` | `boxes` list | Replace the persistent bounding-box overlay on screenshots |
-| `add_boxes` | `boxes` list | Append boxes to the persistent overlay without clearing it |
+| `reset_level` | — | Press `R` to restart the current level and clear the level map |
+| `level_map` | `rows`, `updates`, or `clear` | Store the model's own text grid of the level |
 
-Each movement tool captures a fresh screenshot after moving and returns it to
-the model.
+Movement tools capture a fresh frame for blocked-move detection and replay, but
+do not return a screenshot to the model. Call `view_board` when you need to see
+the result.
 
-`set_boxes` takes a list of objects:
+`level_map` is a model-maintained text scratchpad. The model can set a full
+grid and later update individual cells:
 
 ```json
-{"boxes": [{"box_2d": [xmin, ymin, xmax, ymax], "label": "rock"}]}
+{"rows": ["[X] [X] [X] [X]", "[X] [H] [S] [D]", "[X] [X] [X] [X]"]}
+{"updates": [{"row": 1, "col": 1, "symbol": "."}]}
+{"clear": true}
 ```
 
-Coordinates are screenshot pixels by default. Pass `--scaled-boxes` to use
-scaled coordinates from 1 to 1000 instead, where 1 is the top/left edge and
-1000 is the bottom/right edge.
+The grid is stored by the harness, returned in the tool result, and appended to
+later tool results as `Current level map:` so the model can keep it in sync
+with the game. It is also shown in the web UI sidebar for both live runs and
+replays, and its symbols are drawn onto the web grid overlay. On successful
+moves the harness updates the map automatically: `H` advances, skeletons are
+kicked one cell and destroyed against walls/rocks, and rocks are pushed only
+into empty or spike cells. Blocked moves leave it unchanged. `reset_level`
+clears it.
 
-The boxes are drawn on the current screenshot and every screenshot after it.
-A later `set_boxes` call replaces the overlay completely; an empty list clears
-it. `add_boxes` appends to the current overlay instead. `reset_level` also
-clears the overlay. Known labels get category colors (`spike trap`,
-`skeleton`, `rock`, `demon`, `helltaker`).
-
-Use `--strict-box-labels` to restrict labels to those five categories and
-enable the strict tool schema. Without the flag, arbitrary labels are allowed.
+At the start of the conversation the model also receives reference crops for
+extended spikes, hidden spikes, and rocks from
+`src/itb_harness/references/`, so it can distinguish hazards visually.
 
 The model is instructed to call `view_board` first, plan the whole level
 before moving, and call it again after movement when it needs to re-orient
@@ -219,10 +235,14 @@ level with `R` when a plan fails.
 ```bash
 export MISTRAL_API_KEY=...
 export MISTRAL_MODEL=mistral-large-4   # optional
+export MISTRAL_REASONING_EFFORT=high   # optional
 
 DISPLAY=:2 XAUTHORITY=/run/user/1000/xauth_... \
   uv run itb-agent --backend x11 --window Helltaker --steps 30 --input x11
 ```
+
+`--reasoning-effort` overrides `MISTRAL_REASONING_EFFORT`; when neither is
+set, the model's default reasoning behavior is used.
 
 `--input stub` (the default) records key presses without sending them. Use
 `--input x11` for real XTest input on `DISPLAY`.
@@ -233,12 +253,10 @@ it if the game’s movement animation is not finished before the next screenshot
 `--max-images` controls how many tool screenshots stay in conversation history
 (`0` keeps everything).
 
-`--strict-box-labels` restricts `set_boxes`/`add_boxes` labels to the known
-categories: `spike trap`, `skeleton`, `rock`, `demon`, and `helltaker`. Boxes
-are colored by category either way; the flag controls validation and the tool
-schema. `--scaled-boxes` switches box coordinates from screenshot pixels to
-scaled 1..1000 values. The timeline prints the box arguments, including
-invalid calls, rather than only showing a box count.
+The adapter in `src/itb_harness/agent.py` uses Mistral's Responses API
+(`client.responses.create`) with the full conversation sent as `input` on every
+turn. Function calls and tool results are exchanged as `function_call` and
+`function_call_output` items.
 
 Each iteration:
 

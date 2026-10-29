@@ -30,11 +30,6 @@ class SteerRequest(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
 
 
-class OverlayRequest(BaseModel):
-    name: str = Field(pattern="^(grid|walkability)$")
-    enabled: bool
-
-
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -109,6 +104,7 @@ def _build_turns(
     conversation: list[dict[str, Any]],
     actions: list[dict[str, Any]],
     guidance: list[dict[str, Any]] | None = None,
+    level_maps: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     conversations: dict[int, dict[str, Any]] = {}
     for record in conversation:
@@ -133,11 +129,37 @@ def _build_turns(
         if isinstance(text, str) and text.strip():
             guidance_by_step[step].append(text)
 
+    if level_maps is None:
+        level_maps = []
+
+    maps_by_step: dict[int, list[list[str]] | None] = {}
+    for record in level_maps:
+        try:
+            step = int(record.get("step", 0))
+        except (TypeError, ValueError):
+            continue
+        rows = record.get("rows")
+        if rows is None:
+            maps_by_step[step] = None
+        elif isinstance(rows, list):
+            maps_by_step[step] = [
+                [str(cell) for cell in row]
+                for row in rows
+                if isinstance(row, list)
+            ]
+
+    map_steps = sorted(maps_by_step)
+    map_index = 0
+    current_map: list[list[str]] | None = None
+
     steps = sorted(
         set(conversations) | set(actions_by_step) | set(guidance_by_step)
     )
     turns = []
     for step in steps:
+        while map_index < len(map_steps) and map_steps[map_index] <= step:
+            current_map = maps_by_step[map_steps[map_index]]
+            map_index += 1
         record = conversations.get(step, {})
         turns.append(
             {
@@ -146,6 +168,7 @@ def _build_turns(
                 "thinking": record.get("thinking"),
                 "usage": record.get("usage"),
                 "guidance": guidance_by_step.get(step, []),
+                "level_map": current_map,
                 "actions": actions_by_step.get(step, []),
             }
         )
@@ -166,12 +189,15 @@ def load_run(run_dir: Path) -> dict[str, Any]:
     conversation = _read_jsonl(run_dir / "conversation.jsonl")
     actions = _read_jsonl(run_dir / "actions.jsonl")
     guidance = _read_jsonl(run_dir / "guidance.jsonl")
+    level_maps = _read_jsonl(run_dir / "level_map.jsonl")
+    turns = _build_turns(conversation, actions, guidance, level_maps)
 
     return {
         "id": run_dir.name,
         "metadata": metadata,
         "frames": frames,
-        "turns": _build_turns(conversation, actions, guidance),
+        "turns": turns,
+        "level_map": turns[-1]["level_map"] if turns else None,
     }
 
 
@@ -264,10 +290,10 @@ def create_app(runs_dir: Path, live: Any | None = None) -> FastAPI:
         ok = session.steer(payload.text)
         return {"ok": ok, **session.snapshot()}
 
-    @app.post("/api/live/overlay")
-    def api_live_overlay(payload: OverlayRequest) -> dict[str, Any]:
+    @app.post("/api/live/reset")
+    def api_live_reset() -> dict[str, Any]:
         session = _require_live()
-        ok = session.set_overlay(payload.name, payload.enabled)
+        ok = session.reset()
         return {"ok": ok, **session.snapshot()}
 
     @app.get("/api/live/events")

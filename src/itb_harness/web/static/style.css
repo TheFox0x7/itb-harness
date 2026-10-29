@@ -126,38 +126,6 @@ button.primary:hover { background: #258567; }
 .live-follow { margin-left: auto; }
 .live-error { color: var(--error); font-size: 12px; }
 
-.live-overlays {
-  display: inline-flex;
-  gap: 4px;
-  margin-left: 8px;
-}
-
-.overlay-toggle {
-  font-size: 11px;
-  padding: 2px 8px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: transparent;
-  color: var(--muted);
-  cursor: pointer;
-}
-
-.overlay-toggle:hover:not(:disabled) {
-  border-color: var(--accent);
-  color: var(--text);
-}
-
-.overlay-toggle.active {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
-}
-
-.overlay-toggle:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
 .live-steer {
   display: flex;
   align-items: center;
@@ -359,6 +327,43 @@ button.primary:hover { background: #258567; }
 }
 
 .muted { color: var(--muted); }
+
+.level-map-panel {
+  border-bottom: 1px solid var(--line);
+  background: #131a1f;
+  padding: 8px 10px 10px;
+  max-height: 28vh;
+  overflow: auto;
+}
+
+.level-map-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 6px;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.level-map-head .muted {
+  margin-left: auto;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+#level-map {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--text);
+  white-space: pre;
+}
+
 .timeline {
   flex: 1 1 auto;
   min-height: 0;
@@ -527,12 +532,6 @@ button.primary:hover { background: #258567; }
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.action-args.boxes {
-  white-space: normal;
-  overflow-wrap: anywhere;
-  flex: 1 1 auto;
 }
 
 .action-result {

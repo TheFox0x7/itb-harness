@@ -20,9 +20,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .agent import ChatAgent, MistralAgent, ModelToolCall, ModelTurn
-from .annotate import BoxAnnotation, annotate_boxes
-from .board_overlay import annotate_combined, default_grid
-from .board_tools import parse_boxes_args, tool_schemas
+from .board_tools import (
+    apply_move_to_level_map,
+    format_level_map,
+    parse_level_map_args,
+    tool_schemas,
+)
+from .grid_overlay import annotate_helltaker_grid
 from .capture import (
     BackendUnavailable,
     CaptureBackend,
@@ -86,26 +90,20 @@ You are controlling Helltaker, a grid-based puzzle game.
 You do not receive screenshots automatically. Use view_board to capture the
 current game screen.
 
+Screenshots include a grid overlay: 68x72 pixel cells, up to 9 columns centered
+on the screen, anchored to the red floor.
+
 Tools:
 - move_up: press the Up arrow.
 - move_down: press the Down arrow.
 - move_left: press the Left arrow.
 - move_right: press the Right arrow.
-- reset_level: press R to restart the current level and clear the
-  bounding-box overlay.
-- toggle_grid: toggle a coordinate grid overlay on screenshots. When
-  enabled, each tile is labeled with its row and column (e.g. r3c2).
-  Use this to reference positions precisely and plan paths.
-- toggle_walkability: toggle a walkability overlay. When enabled,
-  walkable tiles are tinted green and blocked tiles are tinted red.
-  Use this to see which areas are open paths vs walls.
-- set_boxes: replace the persistent bounding-box overlay on screenshots.
-  Pass `boxes` as a list of `{"box_2d": [xmin, ymin, xmax, ymax],
-  "label": string}` objects. Coordinates are screenshot pixels. The overlay
-  is applied to this screenshot and every future screenshot until the next
-  set_boxes call replaces it completely.
-- add_boxes: append boxes to the existing overlay without clearing the
-  previous boxes. Uses the same `boxes` format as set_boxes.
+- reset_level: press R to restart the current level and clear the level map.
+- level_map: create or update your own text map of the level. Pass `rows`
+  as a list of equal-width rows, for example ["[X] [X] [H]", "[X] [.] [D]"].
+  Suggested symbols: X=wall/blocked, .=open floor, H=Helltaker, S=skeleton,
+  T=spike trap, D=demon, R=rock, ?=unknown. Use `updates` to change individual cells
+  or `clear` to remove the map. It does not change the game.
 
 Each movement tool moves exactly one tile. Movement is tile-based: a move
 should advance one tile unless blocked by a wall, object, or the edge of the
@@ -137,6 +135,9 @@ Pay attention to your previous steps. User can interject and help you on your wa
 Call view_board first. After moving, call view_board again when you need to
 see the result or re-orient yourself. Do not describe an action in prose; call a tool.
 
+Use the map to navigate and plan your moves. The map autoupdates on successful moves but does not take everything into account.
+If your move is blocked but map has no obstacle that would suggest it, it means you mapped it out incorrectly. Look at it again instead of repeating.
+
 === MANDATORY WORKFLOW ===
 
 1. PLAN BEFORE MOVING. After your first view_board, do NOT move yet.
@@ -148,18 +149,9 @@ see the result or re-orient yourself. Do not describe an action in prose; call a
    - How many moves does that path need? Do you have enough steps?
    Only start moving after you have a complete plan.
 
-2. MARK THE BOARD. After analyzing, use set_boxes to mark key entities:
-   - The demon: label "demon"
-   - Each skeleton: label "skeleton"
-   - Yourself: label "helltaker"
-   - Spike traps: label "spike trap"
-   These boxes persist on all future screenshots, so you can track the
-   board even after old screenshots are removed from your context.
-
-   Also consider enabling overlays to aid your analysis:
-   - toggle_grid: shows row/column labels on each tile (e.g. r3c2)
-   - toggle_walkability: tints walkable tiles green, blocked tiles red
-   These help you see the board geometry and plan paths.
+2. MARK THE BOARD. After analyzing use level_map once you understand the layout, then update it
+   after moves or new observations so it stays accurate. The current map is
+   included with subsequent tool results.
 
 3. CHECK MOVE RESULTS. After every movement tool, the result tells you
    whether the move was BLOCKED (no step consumed) or consumed a step.
@@ -224,24 +216,61 @@ These are general puzzle-solving principles. Apply them to any level:
 """
 
 
-def build_system_prompt(
-    strict_box_labels: bool = False,
-    scaled_boxes: bool = False,
-) -> str:
-    prompt = SYSTEM_PROMPT
-    if scaled_boxes:
-        prompt += (
-            "\nFor set_boxes and add_boxes, box coordinates are scaled from "
-            "1 to 1000, where 1 is the top/left edge and 1000 is the "
-            "bottom/right edge."
+def build_system_prompt() -> str:
+    return SYSTEM_PROMPT
+
+
+def _reference_message() -> dict[str, Any] | None:
+    """Build the user message containing visual hazard references."""
+
+    references = (
+        (
+            "Spikes - extended",
+            "bright white/bone spikes protruding from the floor.",
+            "spikes_extended.png",
+        ),
+        (
+            "Spikes - hidden",
+            "dark slots/holes in the red floor; the spikes are retracted "
+            "but still dangerous.",
+            "spikes_hidden.png",
+        ),
+        (
+            "Rock",
+            "large pink cracked boulder occupying a tile; it blocks movement.",
+            "rock.png",
+        ),
+    )
+    directory = Path(__file__).parent / "references"
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": (
+                "Reference images for Helltaker hazards. Use these to "
+                "recognize them in screenshots:"
+            ),
+        }
+    ]
+    for label, description, filename in references:
+        path = directory / filename
+        if not path.is_file():
+            continue
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        content.append(
+            {"type": "text", "text": f"{label}: {description}"}
         )
-    if strict_box_labels:
-        prompt += (
-            "\nFor set_boxes and add_boxes, labels must be exactly one of: "
-            "spike trap, skeleton, rock, demon, helltaker. Boxes are colored "
-            "by category."
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{encoded}",
+                },
+            }
         )
-    return prompt
+
+    if len(content) == 1:
+        return None
+    return {"role": "user", "content": content}
 
 
 @dataclass(slots=True)
@@ -249,8 +278,6 @@ class LoopConfig:
     max_steps: int = 20
     max_images: int = 4
     action_delay: float = 0.5
-    strict_box_labels: bool = False
-    scaled_boxes: bool = False
     show_thinking: bool = False
     console: bool = True
     out_dir: Path = field(default_factory=lambda: Path("runs"))
@@ -292,9 +319,11 @@ class Recorder:
         self.actions_path = self.root / "actions.jsonl"
         self.conversation_path = self.root / "conversation.jsonl"
         self.guidance_path = self.root / "guidance.jsonl"
+        self.level_map_path = self.root / "level_map.jsonl"
         self._actions = self.actions_path.open("a", encoding="utf-8")
         self._conversation = self.conversation_path.open("a", encoding="utf-8")
         self._guidance_log = self.guidance_path.open("a", encoding="utf-8")
+        self._level_map_log = self.level_map_path.open("a", encoding="utf-8")
 
         (self.root / "run.json").write_text(
             json.dumps(
@@ -307,8 +336,6 @@ class Recorder:
                     "max_steps": config.max_steps,
                     "max_images": config.max_images,
                     "action_delay": config.action_delay,
-                    "strict_box_labels": config.strict_box_labels,
-                    "scaled_boxes": config.scaled_boxes,
                     "started_at": datetime.now(timezone.utc).isoformat(
                         timespec="seconds"
                     ),
@@ -385,10 +412,18 @@ class Recorder:
         self._actions.write(json.dumps(record) + "\n")
         self._actions.flush()
 
+    def log_level_map(
+        self, step: int, rows: list[list[str]] | None
+    ) -> None:
+        record = {"step": step, "rows": rows}
+        self._level_map_log.write(json.dumps(record) + "\n")
+        self._level_map_log.flush()
+
     def close(self) -> None:
         self._actions.close()
         self._conversation.close()
         self._guidance_log.close()
+        self._level_map_log.close()
 
 
 class ThinkingPrinter:
@@ -449,9 +484,7 @@ class HarnessLoop:
         self.final_text: str | None = None
         self._closed = False
         self.event_callback: Callable[[dict[str, Any]], None] | None = None
-        self.box_overlay: list[BoxAnnotation] = []
-        self._show_grid: bool = False
-        self._show_walkability: bool = False
+        self.level_map: list[list[str]] | None = None
         self._move_history: list[dict[str, object]] = []
         self._guidance: deque[str] = deque()
         self._guidance_lock = threading.Lock()
@@ -464,29 +497,62 @@ class HarnessLoop:
                 print(f"Notes   {notes.path} ({notes.char_count} chars loaded)")
             print(f"Output  {self.recorder.root}")
 
-        system_prompt = build_system_prompt(
-            self.config.strict_box_labels,
-            self.config.scaled_boxes,
-        )
-        if input_backend.name == "stub":
+        self.messages: list[dict[str, Any]] = self._initial_messages()
+
+    def _initial_messages(self) -> list[dict[str, Any]]:
+        system_prompt = build_system_prompt()
+        if self.input.name == "stub":
             system_prompt += (
                 "\n\nInput is in stub/dry-run mode: actions are recorded but "
                 "NOT sent to the game, so the board will not change."
             )
-        if notes is not None:
-            rendered_notes = notes.render_for_prompt()
+        if self.notes is not None:
+            rendered_notes = self.notes.render_for_prompt()
             if rendered_notes:
                 system_prompt += "\n\n" + rendered_notes
 
-        self.messages: list[dict[str, Any]] = [
+        messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
+        ]
+        references = _reference_message()
+        if references is not None:
+            messages.append(references)
+        messages.append(
             {
                 "role": "user",
                 "content": (
                     "Start by calling view_board. Use one tool per turn."
                 ),
-            },
-        ]
+            }
+        )
+        return messages
+
+    def reset(self) -> None:
+        """Reset the conversation and counters, starting a fresh run."""
+
+        self.recorder.close()
+        self.recorder = Recorder(
+            self.config.out_dir,
+            self.backend,
+            self.input,
+            getattr(self.agent, "model", "unknown"),
+            getattr(self.agent, "prompt_cache_key", None),
+            self.notes,
+            self.target,
+            self.config,
+        )
+        self.messages = self._initial_messages()
+        self.frame = None
+        self.last_frame_path = None
+        self._prev_frame_png = None
+        self.level_map = None
+        self._move_history.clear()
+        with self._guidance_lock:
+            self._guidance.clear()
+        self.action_count = 0
+        self.step_index = 0
+        self.final_text = None
+        self._closed = False
 
     def _emit(self, event_type: str, **data: Any) -> None:
         if self.event_callback is not None:
@@ -519,21 +585,6 @@ class HarnessLoop:
             self._prev_frame_png = self.frame.png
         frame = self.backend.capture_window(self.target.id)
         self.target = frame.window
-        if self.box_overlay:
-            frame = replace(
-                frame,
-                png=annotate_boxes(frame.png, self.box_overlay),
-            )
-        if self._show_grid or self._show_walkability:
-            frame = replace(
-                frame,
-                png=annotate_combined(
-                    frame.png,
-                    grid=default_grid(frame.width, frame.height),
-                    show_grid=self._show_grid,
-                    show_walkability=self._show_walkability,
-                ),
-            )
         self.frame = frame
         path = self.recorder.save_frame(frame)
         self.last_frame_path = path
@@ -580,6 +631,11 @@ class HarnessLoop:
         if self.config.action_delay > 0:
             time.sleep(self.config.action_delay)
 
+    def _level_map_note(self) -> str:
+        if not self.level_map:
+            return ""
+        return "Current level map:\n" + format_level_map(self.level_map)
+
     def _format_history(self) -> str:
         """Format recent move history as a compact summary."""
         if not self._move_history:
@@ -600,6 +656,23 @@ class HarnessLoop:
         self, call: ModelToolCall
     ) -> tuple[ToolResult, Path | None]:
         try:
+            if call.name == "level_map":
+                updated = parse_level_map_args(
+                    call.arguments,
+                    self.level_map,
+                )
+                self.level_map = updated
+                if not updated:
+                    message = "Level map cleared."
+                else:
+                    height = len(updated)
+                    width = len(updated[0])
+                    message = (
+                        f"Level map set ({height}x{width}).\n\n"
+                        f"{format_level_map(updated)}"
+                    )
+                return ToolResult(ok=True, message=message), None
+
             if call.name == "view_board":
                 frame = self._capture()
                 return (
@@ -614,63 +687,9 @@ class HarnessLoop:
                     self.last_frame_path,
                 )
 
-            if call.name in {"set_boxes", "add_boxes"}:
-                if self.frame is None:
-                    raise ValueError(
-                        f"Call view_board before {call.name}."
-                    )
-                boxes = parse_boxes_args(
-                    call.arguments,
-                    strict_labels=self.config.strict_box_labels,
-                    scaled_boxes=self.config.scaled_boxes,
-                    width=self.frame.width,
-                    height=self.frame.height,
-                )
-                for box in boxes:
-                    if not (
-                        0 <= box.xmin < box.xmax <= self.frame.width
-                        and 0 <= box.ymin < box.ymax <= self.frame.height
-                    ):
-                        raise ValueError(
-                            "Bounding box is outside the screenshot "
-                            f"{self.frame.width}x{self.frame.height}."
-                        )
-                if call.name == "set_boxes":
-                    self.box_overlay = boxes
-                else:
-                    self.box_overlay = [*self.box_overlay, *boxes]
-                self._pause()
-                frame = self._capture()
-                if call.name == "set_boxes":
-                    if boxes:
-                        message = (
-                            f"Overlay set with {len(boxes)} boxes. "
-                            f"Screenshot attached "
-                            f"({frame.width}x{frame.height})."
-                        )
-                    else:
-                        message = (
-                            "Overlay cleared. Screenshot attached "
-                            f"({frame.width}x{frame.height})."
-                        )
-                else:
-                    message = (
-                        f"Added {len(boxes)} boxes; overlay now has "
-                        f"{len(self.box_overlay)}. Screenshot attached "
-                        f"({frame.width}x{frame.height})."
-                    )
-                return (
-                    ToolResult(
-                        ok=True,
-                        message=message,
-                        image_png=frame.png,
-                    ),
-                    self.last_frame_path,
-                )
-
             if call.name == "reset_level":
                 self.input.key("r")
-                self.box_overlay = []
+                self.level_map = None
                 self.action_count += 1
                 self._pause()
                 frame = self._capture()
@@ -681,52 +700,12 @@ class HarnessLoop:
                     ToolResult(
                         ok=True,
                         message=(
-                            "Level reset with R; bounding-box overlay cleared. "
+                            "Level reset with R; level map cleared. "
                             f"Screenshot attached "
                             f"({frame.width}x{frame.height})."
                         ),
                         image_png=frame.png,
                         state_changed=True,
-                    ),
-                    self.last_frame_path,
-                )
-
-            if call.name == "toggle_grid":
-                args = call.arguments if isinstance(call.arguments, dict) else {}
-                enabled = bool(args.get("enabled", True))
-                self._show_grid = enabled
-                self._pause()
-                frame = self._capture()
-                state = "enabled" if enabled else "disabled"
-                return (
-                    ToolResult(
-                        ok=True,
-                        message=(
-                            f"Grid overlay {state}. "
-                            f"Screenshot attached "
-                            f"({frame.width}x{frame.height})."
-                        ),
-                        image_png=frame.png,
-                    ),
-                    self.last_frame_path,
-                )
-
-            if call.name == "toggle_walkability":
-                args = call.arguments if isinstance(call.arguments, dict) else {}
-                enabled = bool(args.get("enabled", True))
-                self._show_walkability = enabled
-                self._pause()
-                frame = self._capture()
-                state = "enabled" if enabled else "disabled"
-                return (
-                    ToolResult(
-                        ok=True,
-                        message=(
-                            f"Walkability overlay {state}. "
-                            f"Screenshot attached "
-                            f"({frame.width}x{frame.height})."
-                        ),
-                        image_png=frame.png,
                     ),
                     self.last_frame_path,
                 )
@@ -758,25 +737,20 @@ class HarnessLoop:
                 if blocked:
                     message = (
                         f"Move {key} was BLOCKED — no step consumed. "
-                        f"The screenshot is unchanged. Do NOT repeat this "
-                        f"move. Try a different direction or call "
-                        f"view_board to re-assess. "
-                        f"{history_str} "
-                        f"Screenshot attached "
-                        f"({frame.width}x{frame.height})."
+                        f"Do NOT repeat this move. Try a different direction "
+                        f"or call view_board to re-assess. "
+                        f"{history_str}"
                     )
                 else:
                     message = (
                         f"Moved {key} one tile. Step consumed. "
                         f"{history_str} "
-                        f"Screenshot attached "
-                        f"({frame.width}x{frame.height})."
+                        "Call view_board to see the result."
                     )
                 return (
                     ToolResult(
                         ok=True,
                         message=message,
-                        image_png=frame.png,
                         state_changed=not blocked if blocked is not None else True,
                         blocked=blocked,
                     ),
@@ -847,10 +821,7 @@ class HarnessLoop:
         try:
             turn = self.agent.complete(
                 self.messages,
-                tools=tool_schemas(
-                    strict_labels=self.config.strict_box_labels,
-                    scaled_boxes=self.config.scaled_boxes,
-                ),
+                tools=tool_schemas(),
                 on_thinking=on_thinking,
                 on_content=on_content,
             )
@@ -926,12 +897,44 @@ class HarnessLoop:
                     "(stub input: action was recorded but not sent)"
                 ),
             )
+        if result.image_png:
+            result = replace(
+                result,
+                image_png=annotate_helltaker_grid(result.image_png),
+            )
+        map_updated = False
+        if (
+            result.ok
+            and primary.name in MOVE_KEYS
+            and result.blocked is False
+        ):
+            updated_map = apply_move_to_level_map(
+                self.level_map,
+                primary.name,
+            )
+            if updated_map is not None and updated_map != self.level_map:
+                self.level_map = updated_map
+                map_updated = True
+        map_note = self._level_map_note()
+        if result.ok and primary.name != "level_map" and map_note:
+            result = replace(
+                result,
+                message=(
+                    f"{result.message}\n\n{map_note}"
+                    if result.message
+                    else map_note
+                ),
+            )
         self.messages.append(
             result.as_tool_message(primary.id, primary.name)
         )
         self.recorder.log_tool_call(
             step, primary, result, next_frame, source_frame
         )
+        if map_updated or (
+            result.ok and primary.name in {"level_map", "reset_level"}
+        ):
+            self.recorder.log_level_map(step, self.level_map)
         self._emit(
             "tool_result",
             step=step,
@@ -1085,24 +1088,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--strict-box-labels",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Restrict set_boxes labels to the known Helltaker categories "
-            "and color boxes by category (default: off)."
-        ),
-    )
-    parser.add_argument(
-        "--scaled-boxes",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Use scaled 1..1000 coordinates for set_boxes/add_boxes instead "
-            "of screenshot pixels (default: pixels)."
-        ),
-    )
-    parser.add_argument(
         "--stream",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1153,6 +1138,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mistral model (default: MISTRAL_MODEL or mistral-large-4).",
     )
     parser.add_argument(
+        "--reasoning-effort",
+        default=None,
+        choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+        help=(
+            "Mistral reasoning effort; defaults to MISTRAL_REASONING_EFFORT "
+            "or the model default."
+        ),
+    )
+    parser.add_argument(
         "--list",
         dest="list_windows",
         action="store_true",
@@ -1199,6 +1193,7 @@ def main(argv: list[str] | None = None) -> int:
                 prompt_cache_key=args.cache_key,
                 stream=args.stream,
                 timeout_ms=max(1, int(args.model_timeout * 1000)),
+                reasoning_effort=args.reasoning_effort,
             )
         except RuntimeError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -1220,8 +1215,6 @@ def main(argv: list[str] | None = None) -> int:
             max_steps=max(1, args.steps),
             max_images=args.max_images,
             action_delay=max(0.0, args.action_delay),
-            strict_box_labels=args.strict_box_labels,
-            scaled_boxes=args.scaled_boxes,
             show_thinking=args.show_thinking,
             console=not args.web,
             out_dir=args.out.expanduser(),

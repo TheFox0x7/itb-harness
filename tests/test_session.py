@@ -15,6 +15,18 @@ from itb_harness.input import StubInput
 from itb_harness.loop import HarnessLoop, LoopConfig
 from itb_harness.session import SessionRunner
 
+def message_text(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict)
+        )
+    return str(content)
+
+
 def tiny_png() -> bytes:
     buffer = BytesIO()
     Image.new("RGB", (10, 10), (0, 0, 0)).save(buffer, format="PNG")
@@ -183,7 +195,7 @@ class SessionRunnerTests(unittest.TestCase):
             wait_for(lambda: runner.snapshot()["state"] == "stopped")
             self.assertEqual(runner.snapshot()["pending_guidance"], 0)
             combined = "\n".join(
-                message["content"]
+                message_text(message["content"])
                 for message in loop.messages
                 if message.get("role") == "user"
             )
@@ -205,33 +217,99 @@ class SessionRunnerTests(unittest.TestCase):
             self.assertEqual(runner.snapshot()["reason"], "user_stop")
             runner.join(timeout=1.0)
 
-    def test_set_overlay_toggles_loop_state(self) -> None:
+    def test_snapshot_exposes_level_map(self) -> None:
+        turns = [
+            ModelTurn(
+                tool_calls=(
+                    call("level_map", {"rows": ["XH", "XD"]}),
+                )
+            ),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = HarnessLoop(
+                FakeBackend(),
+                WINDOW,
+                ScriptedAgent(turns),
+                StubInput(),
+                LoopConfig(action_delay=0, out_dir=Path(tmp)),
+            )
+            runner = SessionRunner(loop)
+            runner.start()
+            try:
+                self.assertTrue(runner.step())
+                wait_for(lambda: runner.snapshot()["state"] == "paused")
+                self.assertEqual(
+                    runner.snapshot()["level_map"],
+                    [["X", "H"], ["X", "D"]],
+                )
+            finally:
+                runner.stop()
+                runner.join(timeout=1.0)
+
+    def test_reset_clears_model_state_and_starts_new_run(self) -> None:
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("move_up"),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            loop = HarnessLoop(
+                FakeBackend(),
+                WINDOW,
+                ScriptedAgent(turns),
+                StubInput(),
+                LoopConfig(max_steps=20, action_delay=0, out_dir=Path(tmp)),
+            )
+            runner = SessionRunner(loop)
+            runner.start()
+            try:
+                self.assertTrue(runner.step())
+                wait_for(lambda: runner.snapshot()["state"] == "paused")
+                old_run_id = runner.run_id
+                self.assertEqual(runner.snapshot()["steps"], 1)
+
+                self.assertTrue(runner.reset())
+                snapshot = runner.snapshot()
+                self.assertEqual(snapshot["state"], "paused")
+                self.assertEqual(snapshot["steps"], 0)
+                self.assertEqual(snapshot["actions"], 0)
+                self.assertEqual(snapshot["frames"], 0)
+                self.assertNotEqual(snapshot["run_id"], old_run_id)
+                self.assertEqual(
+                    [message["role"] for message in loop.messages],
+                    ["system", "user", "user"],
+                )
+                self.assertTrue((loop.recorder.root / "run.json").is_file())
+
+                self.assertTrue(runner.step())
+                wait_for(lambda: runner.snapshot()["steps"] == 1)
+            finally:
+                runner.stop()
+                runner.join(timeout=1.0)
+
+    def test_reset_after_model_stopped_restarts_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             loop = HarnessLoop(
                 FakeBackend(),
                 WINDOW,
                 ScriptedAgent([ModelTurn(content="done")]),
                 StubInput(),
-                LoopConfig(out_dir=Path(tmp)),
+                LoopConfig(action_delay=0, out_dir=Path(tmp)),
             )
             runner = SessionRunner(loop)
             runner.start()
             try:
-                self.assertTrue(runner.set_overlay("grid", True))
-                self.assertTrue(loop._show_grid)
-                snap = runner.snapshot()
-                self.assertTrue(snap["overlays"]["grid"])
-                self.assertFalse(snap["overlays"]["walkability"])
+                self.assertTrue(runner.step())
+                wait_for(lambda: runner.snapshot()["state"] == "stopped")
+                old_run_id = runner.run_id
 
-                self.assertTrue(runner.set_overlay("walkability", True))
-                self.assertTrue(loop._show_walkability)
-                snap = runner.snapshot()
-                self.assertTrue(snap["overlays"]["walkability"])
-
-                self.assertTrue(runner.set_overlay("grid", False))
-                self.assertFalse(loop._show_grid)
-
-                self.assertFalse(runner.set_overlay("invalid", True))
+                self.assertTrue(runner.reset())
+                snapshot = runner.snapshot()
+                self.assertEqual(snapshot["state"], "paused")
+                self.assertEqual(snapshot["steps"], 0)
+                self.assertNotEqual(snapshot["run_id"], old_run_id)
+                self.assertTrue(snapshot["thread_alive"])
             finally:
                 runner.stop()
                 runner.join(timeout=1.0)

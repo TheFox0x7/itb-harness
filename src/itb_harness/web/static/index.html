@@ -22,14 +22,11 @@
     <button id="live-resume">Resume</button>
     <button id="live-pause">Pause</button>
     <button id="live-stop">Stop</button>
+    <button id="live-reset" title="Clear the conversation and start a fresh run">Reset</button>
     <label class="toggle live-follow">
       <input id="follow-live" type="checkbox" checked>
       follow
     </label>
-    <span class="live-overlays">
-      <button id="overlay-grid" class="overlay-toggle" title="Toggle coordinate grid overlay">grid</button>
-      <button id="overlay-walkability" class="overlay-toggle" title="Toggle walkability overlay">walk</button>
-    </span>
     <span id="live-error" class="live-error"></span>
   </div>
 
@@ -58,6 +55,10 @@
           <input id="coord-normalized" type="checkbox">
           0–1000
         </label>
+        <label class="toggle" title="68×72 px cells, 9 columns centered, bottom-aligned">
+          <input id="show-grid" type="checkbox" checked>
+          grid
+        </label>
         <label class="toggle">
           <input id="show-markers" type="checkbox" checked>
           markers
@@ -77,6 +78,13 @@
       <div class="timeline-head">
         <h2>Timeline</h2>
         <span id="turn-count" class="muted"></span>
+      </div>
+      <div id="level-map-panel" class="level-map-panel" hidden>
+        <div class="level-map-head">
+          <span>Level map</span>
+          <span id="level-map-meta" class="muted"></span>
+        </div>
+        <pre id="level-map"></pre>
       </div>
       <div id="live-stream" class="live-stream" hidden>
         <div class="live-stream-head">

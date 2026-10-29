@@ -3,35 +3,31 @@
 from __future__ import annotations
 
 import json
-import math
+import re
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .annotate import BoxAnnotation
 
-
-STRICT_BOX_LABELS = (
-    "spike trap",
-    "skeleton",
-    "rock",
-    "demon",
-    "helltaker",
-)
-
-
-class BoxItem(BaseModel):
+class LevelMapCell(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    box_2d: list[float] = Field(min_length=4, max_length=4)
-    label: str = Field(min_length=1)
+    row: int = Field(ge=0)
+    col: int = Field(ge=0)
+    symbol: str = Field(min_length=1, max_length=8)
 
 
-class BoxesArgs(BaseModel):
+class LevelMapArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    boxes: list[BoxItem] = Field(default_factory=list)
+    rows: str | list[str | list[str]] | None = None
+    updates: list[LevelMapCell] = Field(default_factory=list)
+    clear: bool = False
 
+
+_MAX_LEVEL_MAP_ROWS = 64
+_MAX_LEVEL_MAP_COLS = 64
+_BRACKET_RE = re.compile(r"\[([^\[\]]+)\]")
 
 _EMPTY_SCHEMA = {
     "type": "object",
@@ -55,70 +51,58 @@ def _tool(
     }
 
 
-def _boxes_schema(
-    strict_labels: bool, scaled_boxes: bool = False
-) -> dict[str, Any]:
-    label: dict[str, Any] = {
-        "type": "string",
-        "minLength": 1,
-        "description": "Short label describing the boxed object.",
-    }
-    if strict_labels:
-        label["enum"] = list(STRICT_BOX_LABELS)
-        label["description"] = (
-            "One of: " + ", ".join(STRICT_BOX_LABELS) + "."
-        )
+def _level_map_schema() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "boxes": {
+            "rows": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Level rows. Each string may use bracketed cells like "
+                    "\"[X] [X] [H]\" or plain cells like \"X X H\" or "
+                    "\"XXH\". All rows must have the same number of cells."
+                ),
+            },
+            "updates": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "box_2d": {
-                            "type": "array",
-                            "items": (
-                                {
-                                    "type": "number",
-                                    "minimum": 1,
-                                    "maximum": 1000,
-                                }
-                                if scaled_boxes
-                                else {"type": "number"}
-                            ),
-                            "minItems": 4,
-                            "maxItems": 4,
-                            "description": (
-                                "[xmin, ymin, xmax, ymax] in scaled "
-                                "coordinates from 1 to 1000."
-                                if scaled_boxes
-                                else "[xmin, ymin, xmax, ymax] in screenshot "
-                                "pixels."
-                            ),
+                        "row": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "0-based row index.",
                         },
-                        "label": label,
+                        "col": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "0-based column index.",
+                        },
+                        "symbol": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 1,
+                            "description": "New single-character cell value.",
+                        },
                     },
-                    "required": ["box_2d", "label"],
+                    "required": ["row", "col", "symbol"],
                     "additionalProperties": False,
                 },
-            }
+                "description": "Update individual cells in the existing map.",
+            },
+            "clear": {
+                "type": "boolean",
+                "description": "Clear the current map before applying changes.",
+            },
         },
-        "required": ["boxes"],
         "additionalProperties": False,
     }
 
 
-def tool_schemas(
-    strict_labels: bool = False, scaled_boxes: bool = False
-) -> list[dict[str, Any]]:
+def tool_schemas() -> list[dict[str, Any]]:
     """Return the tool definitions visible to the model."""
 
-    coordinate_text = (
-        "scaled coordinates from 1 to 1000"
-        if scaled_boxes
-        else "screenshot pixels"
-    )
     return [
         _tool(
             "view_board",
@@ -147,56 +131,14 @@ def tool_schemas(
             "fails or you are stuck, then try a better plan.",
         ),
         _tool(
-            "toggle_grid",
-            "Toggle a coordinate grid overlay on screenshots. When enabled, "
-            "each tile is labeled with its row and column (e.g. r3c2) so you "
-            "can reference positions precisely. Pass {\"enabled\": true} to "
-            "turn on, {\"enabled\": false} to turn off.",
-            {
-                "type": "object",
-                "properties": {
-                    "enabled": {
-                        "type": "boolean",
-                        "description": "True to show the grid, false to hide it.",
-                    }
-                },
-                "required": ["enabled"],
-                "additionalProperties": False,
-            },
-        ),
-        _tool(
-            "toggle_walkability",
-            "Toggle a walkability overlay on screenshots. When enabled, "
-            "walkable tiles are tinted green and blocked tiles are tinted "
-            "red, based on floor color analysis. This helps you see which "
-            "areas are open paths. Pass {\"enabled\": true} to turn on, "
-            "{\"enabled\": false} to turn off.",
-            {
-                "type": "object",
-                "properties": {
-                    "enabled": {
-                        "type": "boolean",
-                        "description": "True to show walkability, false to hide it.",
-                    }
-                },
-                "required": ["enabled"],
-                "additionalProperties": False,
-            },
-        ),
-        _tool(
-            "set_boxes",
-            "Replace the persistent bounding-box overlay on screenshots. "
-            f"Coordinates are {coordinate_text} as "
-            "[xmin, ymin, xmax, ymax]. The overlay remains on every future "
-            "screenshot until the next set_boxes or add_boxes call.",
-            _boxes_schema(strict_labels, scaled_boxes),
-        ),
-        _tool(
-            "add_boxes",
-            "Append bounding boxes to the persistent overlay without removing "
-            f"existing boxes. Coordinates are {coordinate_text} as "
-            "[xmin, ymin, xmax, ymax].",
-            _boxes_schema(strict_labels, scaled_boxes),
+            "level_map",
+            "Create or update your own text map of the level. This does not "
+            "change the game; it is a persistent scratchpad so you can model "
+            "walls and entity positions. Suggested symbols: X=wall/blocked, "
+            ".=open floor, H=Helltaker, S=skeleton, T=spike trap, D=demon, "
+            "R=rock, ?=unknown. Call it after moving or observing to keep the "
+            "map current. All rows must have the same width.",
+            _level_map_schema(),
         ),
     ]
 
@@ -212,71 +154,226 @@ def _load_object(arguments: Any) -> dict[str, Any]:
     return arguments
 
 
-def _scaled_to_pixel(value: float, size: int) -> int:
-    if size <= 1:
-        return 0
-    pixel = int(round((value - 1) / 999.0 * (size - 1)))
-    return max(0, min(size - 1, pixel))
-
-
-def parse_boxes_args(
+def parse_level_map_args(
     arguments: Any,
-    strict_labels: bool = False,
-    scaled_boxes: bool = False,
-    width: int | None = None,
-    height: int | None = None,
-) -> list[BoxAnnotation]:
+    current: list[list[str]] | None = None,
+) -> list[list[str]] | None:
+    """Apply a level_map tool call and return the new map, or None when clear."""
+
     try:
-        parsed = BoxesArgs.model_validate(_load_object(arguments))
+        parsed = LevelMapArgs.model_validate(_load_object(arguments))
     except ValidationError as exc:
         raise ValueError(_format_validation(exc)) from exc
 
-    boxes: list[BoxAnnotation] = []
-    for item in parsed.boxes:
-        xmin, ymin, xmax, ymax = item.box_2d
-        if not all(math.isfinite(value) for value in item.box_2d):
-            raise ValueError("Bounding-box coordinates must be finite.")
-        if xmax <= xmin or ymax <= ymin:
+    map_rows: list[list[str]] | None = None
+    if current is not None and not parsed.clear:
+        map_rows = [row[:] for row in current]
+
+    if parsed.rows is not None:
+        map_rows = _parse_level_rows(parsed.rows) or None
+
+    if map_rows is None:
+        if parsed.updates:
             raise ValueError(
-                "Bounding box must satisfy xmin < xmax and ymin < ymax."
+                "Call level_map with rows before updating individual cells."
             )
-        if scaled_boxes:
-            if width is None or height is None:
-                raise ValueError(
-                    "Scaled bounding boxes require screenshot dimensions."
-                )
-            if not all(1 <= value <= 1000 for value in item.box_2d):
-                raise ValueError(
-                    "Scaled bounding-box coordinates must be in 1..1000."
-                )
-            xmin, ymin, xmax, ymax = (
-                _scaled_to_pixel(xmin, width),
-                _scaled_to_pixel(ymin, height),
-                _scaled_to_pixel(xmax, width),
-                _scaled_to_pixel(ymax, height),
-            )
-            if xmax <= xmin or ymax <= ymin:
-                raise ValueError(
-                    "Bounding box is too small after scaling."
-                )
-        label = item.label.strip()
-        if not label:
-            raise ValueError("Bounding-box label cannot be empty.")
-        if strict_labels and label not in STRICT_BOX_LABELS:
+        if parsed.clear or parsed.rows is not None:
+            return None
+        raise ValueError("Provide rows, updates, or clear=true.")
+
+    for update in parsed.updates:
+        if update.row >= len(map_rows):
             raise ValueError(
-                "Bounding-box label must be one of: "
-                + ", ".join(STRICT_BOX_LABELS)
+                f"Level-map row {update.row} is outside the map "
+                f"(0..{len(map_rows) - 1})."
             )
-        boxes.append(
-            BoxAnnotation(
-                xmin=int(round(xmin)),
-                ymin=int(round(ymin)),
-                xmax=int(round(xmax)),
-                ymax=int(round(ymax)),
-                label=label,
+        width = len(map_rows[update.row])
+        if update.col >= width:
+            raise ValueError(
+                f"Level-map column {update.col} is outside row "
+                f"{update.row} (0..{width - 1})."
             )
+        map_rows[update.row][update.col] = _normalize_symbol(update.symbol)
+
+    return map_rows
+
+
+_MOVE_DELTAS = {
+    "move_up": (-1, 0),
+    "move_down": (1, 0),
+    "move_left": (0, -1),
+    "move_right": (0, 1),
+}
+_EMPTY = "."
+_HELLTAKER = "H"
+_SKELETON = "S"
+_ROCK = "R"
+_WALL = "X"
+_SPIKE = "T"
+
+
+def apply_move_to_level_map(
+    rows: list[list[str]] | None,
+    direction: str,
+) -> list[list[str]] | None:
+    """Return the map after a successful Helltaker move, or None if unchanged.
+
+    Rules:
+    - empty destination: move H there and clear the old cell;
+    - skeleton: kick it one cell further, or remove it into a wall/rock;
+    - rock: push it one cell only when the next cell is empty or spikes.
+
+    Walls, unknown cells, spikes, demons, and out-of-bounds outcomes do not
+    change the map because the move should have been reported as blocked.
+    """
+
+    if not rows:
+        return None
+    delta = _MOVE_DELTAS.get(direction)
+    if delta is None:
+        return None
+
+    updated = [row[:] for row in rows]
+    player = _find_symbol(updated, _HELLTAKER)
+    if player is None:
+        return None
+    player_row, player_col = player
+    row, col = player_row + delta[0], player_col + delta[1]
+    if not _inside(updated, row, col):
+        return None
+
+    destination = updated[row][col].upper()
+    if destination == _EMPTY:
+        updated[row][col] = _HELLTAKER
+        updated[player_row][player_col] = _EMPTY
+        return updated
+
+    if destination == _SKELETON:
+        next_row, next_col = row + delta[0], col + delta[1]
+        if (
+            not _inside(updated, next_row, next_col)
+            or updated[next_row][next_col].upper() in {_WALL, _ROCK}
+        ):
+            # The skeleton is destroyed against the obstacle.
+            updated[row][col] = _HELLTAKER
+        else:
+            updated[next_row][next_col] = _SKELETON
+            updated[row][col] = _HELLTAKER
+        updated[player_row][player_col] = _EMPTY
+        return updated
+
+    if destination == _ROCK:
+        next_row, next_col = row + delta[0], col + delta[1]
+        if (
+            _inside(updated, next_row, next_col)
+            and updated[next_row][next_col].upper()
+            in {_EMPTY, _SPIKE}
+        ):
+            updated[next_row][next_col] = _ROCK
+            updated[row][col] = _HELLTAKER
+            updated[player_row][player_col] = _EMPTY
+            return updated
+        return None
+
+    return None
+
+
+def _find_symbol(
+    rows: list[list[str]], symbol: str
+) -> tuple[int, int] | None:
+    for row, cells in enumerate(rows):
+        for col, cell in enumerate(cells):
+            if cell.upper() == symbol:
+                return row, col
+    return None
+
+
+def _inside(rows: list[list[str]], row: int, col: int) -> bool:
+    return 0 <= row < len(rows) and 0 <= col < len(rows[row])
+
+
+def format_level_map(rows: list[list[str]]) -> str:
+    """Render a level map in the bracketed grid format."""
+
+    return "\n".join(
+        " ".join(f"[{cell}]" for cell in row)
+        for row in rows
+    )
+
+
+def _parse_level_rows(
+    value: str | list[str | list[str]],
+) -> list[list[str]]:
+    if isinstance(value, str):
+        raw_rows: list[str | list[str]] = [
+            line for line in value.splitlines() if line.strip()
+        ]
+    elif isinstance(value, list):
+        raw_rows = value
+    else:
+        raise ValueError("Level-map rows must be a string or a list.")
+
+    if not raw_rows:
+        return []
+
+    rows: list[list[str]] = []
+    for raw_row in raw_rows:
+        if isinstance(raw_row, str):
+            row = _split_level_row(raw_row)
+        elif isinstance(raw_row, list):
+            row = [_normalize_symbol(cell) for cell in raw_row]
+        else:
+            raise ValueError(
+                "Each level-map row must be a string or a list of cells."
+            )
+        if not row:
+            raise ValueError("Level-map rows cannot be empty.")
+        rows.append(row)
+
+    if not rows:
+        return []
+
+    width = len(rows[0])
+    for index, row in enumerate(rows):
+        if len(row) != width:
+            raise ValueError(
+                "All level-map rows must have the same width; "
+                f"row 0 has {width} cells but row {index} has {len(row)}."
+            )
+    if len(rows) > _MAX_LEVEL_MAP_ROWS:
+        raise ValueError(
+            f"Level map cannot exceed {_MAX_LEVEL_MAP_ROWS} rows."
         )
-    return boxes
+    if width > _MAX_LEVEL_MAP_COLS:
+        raise ValueError(
+            f"Level map cannot exceed {_MAX_LEVEL_MAP_COLS} columns."
+        )
+    return rows
+
+
+def _split_level_row(line: str) -> list[str]:
+    text = line.strip()
+    if not text:
+        return []
+    bracketed = _BRACKET_RE.findall(text)
+    if bracketed:
+        return [_normalize_symbol(token) for token in bracketed]
+    if any(char.isspace() for char in text):
+        return [_normalize_symbol(token) for token in text.split()]
+    return [_normalize_symbol(char) for char in text]
+
+
+def _normalize_symbol(token: str) -> str:
+    symbol = str(token).strip()
+    match = _BRACKET_RE.fullmatch(symbol)
+    if match is not None:
+        symbol = match.group(1).strip()
+    if len(symbol) != 1 or symbol.isspace():
+        raise ValueError(
+            "Level-map cells must be single non-space characters; "
+            f"got {token!r}."
+        )
+    return symbol
 
 
 def _format_validation(exc: ValidationError) -> str:
