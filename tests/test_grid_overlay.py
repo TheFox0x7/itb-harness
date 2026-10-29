@@ -92,6 +92,14 @@ class GridOverlayTests(unittest.TestCase):
         for x, y in ((366, 42), (434, 114)):
             self.assertNotEqual(mapped.getpixel((x, y)), plain.getpixel((x, y)))
 
+    def test_grid_cells_are_labeled(self) -> None:
+        image = Image.new("RGB", (800, 300), (0, 0, 0))
+        result = Image.open(
+            BytesIO(annotate_helltaker_grid(png_bytes(image)))
+        ).convert("RGB")
+        # Bottom cell starts at y=228; the r0c0 label sits in its top-left.
+        self.assertNotEqual(result.getpixel((100, 230)), (0, 0, 0))
+
     def test_cell_dimensions(self) -> None:
         self.assertEqual(CELL_WIDTH, 68)
         self.assertEqual(CELL_HEIGHT, 72)

@@ -72,6 +72,10 @@ class ToolSchemaTests(unittest.TestCase):
         self.assertIn("obstacles are pushable", prompt)
         self.assertIn("step budget", prompt)
         self.assertIn("reset_level", prompt)
+        self.assertIn("beyond the visible", prompt)
+        self.assertIn("desk", prompt)
+        self.assertIn("dark filled squares", prompt)
+        self.assertIn("Dark red rocks", prompt)
 
     def test_system_prompt_mentions_mandatory_workflow(self) -> None:
         prompt = build_system_prompt()
@@ -86,6 +90,9 @@ class ToolSchemaTests(unittest.TestCase):
         self.assertIn("VALIDATE BEFORE EXECUTING", prompt)
         self.assertIn("VERIFY ALIGNMENT", prompt)
         self.assertIn("FIX MAP ERRORS IMMEDIATELY", prompt)
+        self.assertIn("POST-LEVEL DIALOGUE", prompt)
+        self.assertIn("other dialogue option", prompt)
+        self.assertIn("outside of dialogue", prompt)
 
 
 if __name__ == "__main__":

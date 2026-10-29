@@ -131,6 +131,15 @@ class ValidatorTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("barrier", result.reason)
 
+    def test_map_can_extend_beyond_visible_grid(self) -> None:
+        result = validate_solution(
+            [list("........H.D.")],
+            ["move_right"],
+            max_steps=1,
+            spike_mode="static",
+        )
+        self.assertTrue(result.ok)
+
     def test_key_removes_barrier(self) -> None:
         result = validate_solution(
             [["H", "K", "B", "D"]],

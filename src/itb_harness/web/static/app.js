@@ -499,7 +499,38 @@ function drawGrid(ctx) {
     ctx.stroke();
   }
 
+  drawGridCoordinates(ctx, width, height, bottom, left);
   drawLevelMapAnnotations(ctx, width, height, bottom);
+
+  ctx.restore();
+}
+
+function drawGridCoordinates(ctx, width, height, bottom, left) {
+  const boundaries = [0];
+  for (let y = bottom; y > 0; y -= GRID_CELL_H) {
+    boundaries.push(Math.round(y));
+  }
+  boundaries.sort((a, b) => a - b);
+
+  ctx.save();
+  ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+
+  for (let row = 0; row < boundaries.length - 1; row += 1) {
+    const top = boundaries[row];
+    if (top >= height) continue;
+    for (let col = 0; col < GRID_COLUMNS; col += 1) {
+      const x = Math.round(left + col * GRID_CELL_W + 2);
+      if (x < 0 || x > width) continue;
+      const text = `r${boundaries.length - 2 - row}c${col}`;
+      const textWidth = ctx.measureText(text).width;
+      ctx.fillStyle = "rgba(8, 12, 16, 0.6)";
+      ctx.fillRect(x - 1, top + 1, textWidth + 2, 12);
+      ctx.fillStyle = "rgba(220, 230, 240, 0.8)";
+      ctx.fillText(text, x, top + 1);
+    }
+  }
 
   ctx.restore();
 }

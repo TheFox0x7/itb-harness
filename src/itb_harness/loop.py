@@ -136,14 +136,19 @@ Game rules:
 - Spikes are marked by white or black spots on the floor which alternate between hidden and showing as you move.
   They aren't in the early levels so you don't need to be cautious of them.
 - Black tiles are edges and cannot be moved into. The map is grid based but it is not regular.
+- Black or very dark filled squares are solid and impassable. Do not walk into them; map them as X.
+- Dark red rocks are impassable. They are not pushable; map them as X rather than R. R is for the lighter, pushable rocks.
 - Many obstacles are pushable by moving into them.
 - Assume you can only move on the red space. Everything else is blocked. Rocks on the playing field might also be red and impassible
   but they are distinct from flat ground you can navigate.
+- Red floor tiles are passable even when they have faint polygon shading or small color variations. Map them as `.`.
 - Moving into the wall or edges is not a valid move and will not consume steps.
   However it is wasting your time so it is recommended for you to reexamine if your move consumed steps and if not, change strategy.
 - Pillars are usually either obstacles or decoration. They aren't interactive and you can ignore them.
 - White flashes on black screen means you ran out of steps and lost. Next call to view screen will return level as it was after reset.
 - X on the left counter means you are on your last move. This usually means you're about to lose the game unless your next move brings you in front of the demon.
+- The level can extend beyond the visible 9-column grid or the current screen. Keep adding rows and columns to level_map for areas you discover; do not force the map to fit inside the visible grid.
+- One level places the demon beyond the initial screen and grid, behind a desk. Getting in front of the desk counts as the win. Mark the desk cell as D when mapping that level so a plan that finishes adjacent to it validates correctly.
 
 Do not be hesitant to test things out. You're not timed or graded on the task.
 Your goal is to beat the level given and have fun doing it.
@@ -166,8 +171,9 @@ Pay attention to your previous steps. User can interject and help you on your wa
    - H for yourself, D for the demon, S for skeletons, R for rocks,
      T for spikes, K for keys, B for barriers
    Do not leave any visible tile unmapped. The map must be rectangular
-   (all rows the same width). If the top row is partial, pad shorter
-   rows with X on the sides that are off-screen.
+   (all rows the same width). The map may be wider or taller than the
+   visible 9-column grid; keep off-screen cells in the map as you discover
+   them instead of cropping it to the grid.
 
 3. VERIFY ALIGNMENT. Call toggle_map_overlay with enabled=true, then
    view_board. Your map symbols should appear centered on the matching
@@ -211,6 +217,15 @@ Pay attention to your previous steps. User can interject and help you on your wa
    - If the character is where you expected: great, continue or finish.
    - If the plan aborted early (blocked move): the map has an error.
      Go to step 9.
+
+=== POST-LEVEL DIALOGUE ===
+
+- Reaching the demon opens a dialogue with choices. One choice is correct;
+  the other causes the level to repeat.
+- If a choice repeats the level, replay the same move sequence that won
+  previously, then choose the other dialogue option.
+- Use press_space to advance dialogue or confirm a menu choice. Pressing space
+  outside of dialogue does nothing, so do not use it as an exploration move.
 
 === PHASE 4: MAP ERROR CORRECTION ===
 
@@ -308,9 +323,36 @@ def _reference_message() -> dict[str, Any] | None:
             "spikes_hidden.png",
         ),
         (
+            "Passable floor - paired tiles",
+            "two red floor tiles, including one with faint polygon shading; "
+            "both are walkable.",
+            "passable_tiles.png",
+        ),
+        (
+            "Passable floor - single tile",
+            "a single red floor tile; walkable.",
+            "passable_tile.png",
+        ),
+        (
             "Rock",
             "large pink cracked boulder occupying a tile; it blocks movement.",
             "rock.png",
+        ),
+        (
+            "Helltaker",
+            "the player character: a broad-shouldered man in a white suit "
+            "with a red tie and dark hair.",
+            "helltaker.png",
+        ),
+        (
+            "Impassable rocks",
+            "dark red angular rock formations; solid and impassable.",
+            "impassable_rocks.png",
+        ),
+        (
+            "Impassable wall",
+            "black/dark filled wall area edged by red; solid and impassable.",
+            "impassable_wall.png",
         ),
     )
     directory = Path(__file__).parent / "references"
@@ -350,6 +392,8 @@ class LoopConfig:
     max_steps: int = 20
     max_images: int = 4
     action_delay: float = 0.5
+    move_verify_attempts: int = 3
+    move_verify_delay: float = 0.15
     show_thinking: bool = False
     console: bool = True
     out_dir: Path = field(default_factory=lambda: Path("runs"))
@@ -408,6 +452,8 @@ class Recorder:
                     "max_steps": config.max_steps,
                     "max_images": config.max_images,
                     "action_delay": config.action_delay,
+                    "move_verify_attempts": config.move_verify_attempts,
+                    "move_verify_delay": config.move_verify_delay,
                     "started_at": datetime.now(timezone.utc).isoformat(
                         timespec="seconds"
                     ),
@@ -652,7 +698,7 @@ class HarnessLoop:
         with self._guidance_lock:
             return len(self._guidance)
 
-    def _capture(self) -> Frame:
+    def _capture(self, *, save: bool = True) -> Frame:
         # Save the current frame as "previous" before capturing a new one,
         # so movement tools can compare before/after to detect blocked moves.
         if self.frame is not None:
@@ -660,6 +706,11 @@ class HarnessLoop:
         frame = self.backend.capture_window(self.target.id)
         self.target = frame.window
         self.frame = frame
+        if save:
+            self._save_frame(frame)
+        return frame
+
+    def _save_frame(self, frame: Frame) -> Path:
         path = self.recorder.save_frame(frame)
         self.last_frame_path = path
         self._emit(
@@ -675,7 +726,7 @@ class HarnessLoop:
                 f"[{frame.window.monitor or '?'}]  "
                 f"{path.relative_to(self.recorder.root)}"
             )
-        return frame
+        return path
 
     def _prune_images(self) -> None:
         # Keep the latest screenshots and replace older tool-message images
@@ -728,16 +779,30 @@ class HarnessLoop:
 
     def _move(self, direction: str) -> tuple[ToolResult, Path | None]:
         key = MOVE_KEYS[direction]
+        before = self.frame.png if self.frame is not None else None
         self.input.key(key)
         self.action_count += 1
         self._pause()
         frame = self._capture()
 
-        # Detect whether the move actually changed the game state by comparing
-        # the new screenshot with the previous one.
+        # Screenshot timing can be noisy: animations may not have started yet
+        # when the first frame is taken. Poll a few times before declaring the
+        # move blocked.
         blocked: bool | None = None
-        if self._prev_frame_png is not None:
-            changed = _frames_differ(self._prev_frame_png, frame.png)
+        if before is not None:
+            changed = _frames_differ(before, frame.png)
+            attempts = 0
+            while (
+                not changed
+                and attempts < self.config.move_verify_attempts
+            ):
+                if self.config.move_verify_delay > 0:
+                    time.sleep(self.config.move_verify_delay)
+                frame = self._capture(save=False)
+                changed = _frames_differ(before, frame.png)
+                attempts += 1
+            if changed and attempts:
+                self._save_frame(frame)
             blocked = not changed
 
         self._move_history.append({"tool": direction, "blocked": blocked})
@@ -793,6 +858,7 @@ class HarnessLoop:
             )
 
         executed = 0
+        map_warnings: list[str] = []
         for index, move in enumerate(moves, start=1):
             result, frame_path = self._move(move)
             if result.blocked:
@@ -802,7 +868,9 @@ class HarnessLoop:
                         error="plan_blocked",
                         message=(
                             f"Plan step {index} ({move}) was BLOCKED after "
-                            f"{executed} successful moves; aborted."
+                            f"{executed} successful moves; aborted. "
+                            f"Verification attempts: "
+                            f"{self.config.move_verify_attempts}."
                         ),
                     ),
                     frame_path,
@@ -810,30 +878,23 @@ class HarnessLoop:
 
             updated = apply_move_to_level_map(self.level_map, move)
             if updated is None:
-                return (
-                    ToolResult(
-                        ok=False,
-                        error="plan_diverged",
-                        message=(
-                            f"Plan step {index} ({move}) succeeded but the "
-                            "level map could not be updated; aborted."
-                        ),
-                    ),
-                    frame_path,
+                map_warnings.append(
+                    f"step {index} ({move}) succeeded but the map could not "
+                    "be updated"
                 )
-            if updated != self.level_map:
+            elif updated != self.level_map:
                 self.level_map = updated
                 self.recorder.log_level_map(self.step_index, self.level_map)
             executed += 1
 
+        message = (
+            f"Executed {executed}/{len(moves)} planned moves. "
+            "Call view_board to verify the result."
+        )
+        if map_warnings:
+            message += " Map warning: " + "; ".join(map_warnings) + "."
         return (
-            ToolResult(
-                ok=True,
-                message=(
-                    f"Executed {executed}/{len(moves)} planned moves. "
-                    "Call view_board to verify the result."
-                ),
-            ),
+            ToolResult(ok=True, message=message),
             self.last_frame_path,
         )
 
@@ -1302,6 +1363,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--move-verify-attempts",
+        type=int,
+        default=3,
+        help=(
+            "Extra captures to try before declaring a move blocked "
+            "(default: 3)."
+        ),
+    )
+    parser.add_argument(
+        "--move-verify-delay",
+        type=float,
+        default=0.15,
+        help=(
+            "Seconds between move-verification captures (default: 0.15)."
+        ),
+    )
+    parser.add_argument(
         "--stream",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1429,6 +1507,8 @@ def main(argv: list[str] | None = None) -> int:
             max_steps=max(1, args.steps),
             max_images=args.max_images,
             action_delay=max(0.0, args.action_delay),
+            move_verify_attempts=max(0, args.move_verify_attempts),
+            move_verify_delay=max(0.0, args.move_verify_delay),
             show_thinking=args.show_thinking,
             console=not args.web,
             out_dir=args.out.expanduser(),

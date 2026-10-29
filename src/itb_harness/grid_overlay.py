@@ -67,6 +67,50 @@ def find_floor_anchor(mask: np.ndarray) -> int | None:
     return None
 
 
+def _draw_grid_labels(
+    draw: ImageDraw.ImageDraw,
+    *,
+    width: int,
+    height: int,
+    bottom: int,
+    left: float,
+) -> None:
+    boundaries = [0]
+    for y in range(bottom, 0, -CELL_HEIGHT):
+        boundaries.append(int(round(y)))
+    boundaries = sorted(set(boundaries))
+
+    font = ImageFont.load_default(size=10)
+    for row in range(len(boundaries) - 1):
+        top = boundaries[row]
+        if top >= height:
+            continue
+        for col in range(COLUMNS):
+            x = int(round(left + col * CELL_WIDTH + 2))
+            if not (0 <= x < width):
+                continue
+            label_row = len(boundaries) - 2 - row
+            text = f"r{label_row}c{col}"
+            bbox = draw.textbbox((0, 0), text, font=font)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+            draw.rectangle(
+                [
+                    x - 1,
+                    top + 1,
+                    x + text_width + 1,
+                    top + text_height + 2,
+                ],
+                fill=(8, 12, 16, 150),
+            )
+            draw.text(
+                (x, top + 1),
+                text,
+                fill=(220, 230, 240, 190),
+                font=font,
+            )
+
+
 def _draw_level_map(
     draw: ImageDraw.ImageDraw,
     rows: list[list[str]],
@@ -174,6 +218,13 @@ def annotate_helltaker_grid(
             width=1,
         )
 
+    _draw_grid_labels(
+        draw,
+        width=width,
+        height=height,
+        bottom=bottom,
+        left=left,
+    )
     if level_map:
         _draw_level_map(
             draw,

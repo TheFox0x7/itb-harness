@@ -374,13 +374,18 @@ class LoopTests(unittest.TestCase):
             text = message_text(references)
             self.assertIn("Spikes - extended", text)
             self.assertIn("Spikes - hidden", text)
+            self.assertIn("Passable floor - paired tiles", text)
+            self.assertIn("Passable floor - single tile", text)
             self.assertIn("Rock", text)
+            self.assertIn("Helltaker", text)
+            self.assertIn("Impassable rocks", text)
+            self.assertIn("Impassable wall", text)
             images = [
                 part
                 for part in references
                 if isinstance(part, dict) and part.get("type") == "image_url"
             ]
-            self.assertEqual(len(images), 3)
+            self.assertEqual(len(images), 8)
 
     def test_guidance_is_added_to_next_prompt(self) -> None:
         turns = [ModelTurn(content="done")]
@@ -728,6 +733,43 @@ class BlockedMoveTests(unittest.TestCase):
             self.assertTrue(move_record["blocked"])
             self.assertIn("BLOCKED", move_record["message"])
             self.assertFalse(move_record["state_changed"])
+
+    def test_move_verification_retries_before_blocking(self) -> None:
+        """A delayed animation should not be reported as a blocked move."""
+        turns = [
+            ModelTurn(tool_calls=(call("view_board"),)),
+            ModelTurn(tool_calls=(call("move_up"),)),
+            ModelTurn(content="done"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = SequenceBackend(
+                [tiny_png(), tiny_png(), different_png()]
+            )
+            backend.window = WINDOW
+            loop = HarnessLoop(
+                backend,
+                WINDOW,
+                ScriptedAgent(turns),
+                StubInput(),
+                LoopConfig(
+                    max_steps=10,
+                    action_delay=0.0,
+                    move_verify_attempts=2,
+                    move_verify_delay=0.0,
+                    out_dir=Path(tmp),
+                ),
+            )
+            result = loop.run()
+            records = [
+                json.loads(line)
+                for line in (result.run_dir / "actions.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+            move_record = records[1]
+            self.assertEqual(move_record["tool"], "move_up")
+            self.assertFalse(move_record["blocked"])
+            self.assertIn("Step consumed", move_record["message"])
 
     def test_successful_move_when_frames_differ(self) -> None:
         """When the screenshot changes after a move, a step was consumed."""

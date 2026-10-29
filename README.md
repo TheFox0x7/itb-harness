@@ -144,9 +144,11 @@ least one cell-width of continuous red floor pixels (`#8c1c31` / `#700c29`).
 Rows propagate upward from that anchor, so the top row is partial when the
 anchored height is not a multiple of 72 px. The web overlay also draws the
 current `level_map` symbols into the matching grid cells, centered horizontally
-and bottom-aligned. Grid lines are always drawn onto screenshots returned to
-the model; map-symbol annotations are optional there and enabled with
-`toggle_map_overlay`. Saved raw frames remain unmodified.
+and bottom-aligned. Each cell is labeled `r{row}c{col}` with row 0 at the
+bottom of the grid. Grid lines are always drawn onto screenshots returned to the model;
+map-symbol annotations are optional there and enabled with `toggle_map_overlay`.
+`reset_level` captures a fresh frame and recomputes the anchor and overlay.
+Saved raw frames remain unmodified.
 
 Steering is cooperative: the message is added to the model conversation at
 the start of the next turn, not sent as an immediate key press. If the session
@@ -247,11 +249,27 @@ tile. Static extended spikes cost 2 will. The validator rejects maps containing
 `execute_plan` revalidates the same arguments, then plays the moves one at a
 time. It aborts on a blocked move or if the level map cannot be updated. Keys
 and barriers update the map during execution. `press_space` is a separate
-dialogue/confirm action; only `move_*` entries are accepted in plans.
+dialogue/confirm action; only `move_*` entries are accepted in plans. Pressing
+space outside dialogue does nothing. After reaching the demon, one dialogue
+choice is correct and the other restarts the level; if the level restarts,
+replay the same winning sequence and choose the other option.
 
-At the start of the conversation the model also receives reference crops for
-extended spikes, hidden spikes, and rocks from
-`src/itb_harness/references/`, so it can distinguish hazards visually.
+The model is told that a level can extend beyond the visible 9-column grid or
+the current screen, so its map may include off-screen rows and columns. One
+level places the demon beyond the initial screen/grid, behind a desk; there,
+reaching the tile in front of the desk is the win. For that level the model can
+mark the desk cell as `D`, making the validator’s “finish adjacent to D” rule
+match the actual win condition.
+
+The prompt also tells the model that black or very dark filled squares are
+solid and impassable, and that dark red rocks are impassable rather than
+pushable. Both should be mapped as `X`; `R` is reserved for lighter, pushable
+rocks.
+
+At the start of the conversation the model also receives reference crops from
+`src/itb_harness/references/` for extended spikes, hidden spikes, passable
+floor tiles, pushable rocks, Helltaker, impassable rocks, and impassable walls,
+so it can distinguish entities and hazards visually.
 
 The model is instructed to call `view_board` first, plan the whole level
 before moving, and call it again after movement when it needs to re-orient
@@ -275,6 +293,8 @@ set, the model's default reasoning behavior is used.
 
 `--action-delay` waits after a move before capturing (default `0.5`). Increase
 it if the game’s movement animation is not finished before the next screenshot.
+`--move-verify-attempts` and `--move-verify-delay` control extra captures used
+before declaring a move blocked (defaults: `3` attempts, `0.15` seconds).
 
 `--max-images` controls how many tool screenshots stay in conversation history
 (`0` keeps everything).

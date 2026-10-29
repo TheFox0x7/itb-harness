@@ -185,7 +185,8 @@ def tool_schemas() -> list[dict[str, Any]]:
             "walls and entity positions. Symbols: X=wall/blocked, .=open "
             "floor, H=Helltaker, S=skeleton, T=spike trap, D=demon, R=rock, "
             "K=key, B=barrier. Call it after moving or observing to keep the "
-            "map current. All rows must have the same width.",
+            "map current. All rows must have the same width. The map may "
+            "extend beyond the visible 9-column grid.",
             _level_map_schema(),
         ),
         _tool(
@@ -207,9 +208,9 @@ def tool_schemas() -> list[dict[str, Any]]:
         ),
         _tool(
             "press_space",
-            "Press the spacebar. Use this for dialogue, confirmations, and "
-            "menus. It is not a movement step and cannot be included in a "
-            "plan.",
+            "Press the spacebar. Use this only for dialogue, confirmations, "
+            "and menus; pressing space outside dialogue does nothing. It is "
+            "not a movement step and cannot be included in a plan.",
         ),
         _tool(
             "toggle_map_overlay",

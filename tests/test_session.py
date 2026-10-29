@@ -107,7 +107,8 @@ class SessionRunnerTests(unittest.TestCase):
             self.assertEqual(runner.snapshot()["frames"], 1)
 
             self.assertTrue(runner.step())
-            wait_for(lambda: runner.snapshot()["steps"] == 2)
+            wait_for(lambda: runner.snapshot()["state"] == "paused")
+            self.assertEqual(runner.snapshot()["steps"], 2)
             self.assertEqual(runner.snapshot()["actions"], 1)
             self.assertEqual(runner.snapshot()["frames"], 2)
 
