@@ -89,7 +89,8 @@ def _frames_differ(png_a: bytes, png_b: bytes, threshold: float = 0.005) -> bool
     return bool(diff / 255.0 > threshold)
 
 SYSTEM_PROMPT = """\
-You are controlling Helltaker, a grid-based puzzle game.
+You are controlling Helltaker, a grid-based puzzle game. 
+Your main in game goal is to reach a demon on the map and convince her to join your harem.
 
 You do not receive screenshots automatically. Use view_board to capture the
 current game screen.
